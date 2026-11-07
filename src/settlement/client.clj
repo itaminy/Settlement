@@ -37,6 +37,22 @@
                         :resource :wood
                         :amount 5}))
 
+        ;; Проверка границы карты
+    (println "Moving up:")
+    (prn (send-message writer
+                       reader
+                       {:type :move
+                        :player-id 1
+                        :direction :up}))
+                        
+        ;; Перемещение игрока
+    (println "Moving right:")
+    (prn (send-message writer
+                       reader
+                       {:type :move
+                        :player-id 1
+                        :direction :right}))
+
     ;; Получение состояния мира
     (println "World state:")
     (prn (send-message writer

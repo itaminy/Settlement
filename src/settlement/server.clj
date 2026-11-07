@@ -24,6 +24,13 @@
         {:status :error
          :message "Player not found"})
 
+      :move
+      (if (world/move-player player-id (:direction message))
+        {:status :ok
+         :world (world/get-world)}
+        {:status :error
+         :message "Player not found or invalid movement"})
+         
       :state
       {:status :ok
        :world (world/get-world)}
