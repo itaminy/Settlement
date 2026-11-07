@@ -1,0 +1,7 @@
+{:paths ["src" "test"]
+
+ :deps
+ {org.clojure/clojure {:mvn/version "1.12.6"}}
+
+ :aliases
+ {:run {:main-opts ["-m" "settlement.core"]}}}
