@@ -5,7 +5,9 @@
             [settlement.auth-test]
             [settlement.rendering-test]
             [settlement.gui :as gui]
-            [settlement.world :as world]))
+            [settlement.world :as world]
+            [settlement.config :as config]
+            [settlement.layout :as layout]))
 
 ;; Запуск: clojure -M -m settlement.world-test fast (или slow, all).
 (def ^:private initial-world
@@ -29,7 +31,7 @@
     (alter world/world update-in [:players id] assoc :x x :y y)))
 
 (defn- neighbors [[x y]]
-  (filter (fn [[x y]] (and (<= 0 x 11) (<= 0 y 11)))
+  (filter config/in-bounds?
           [[(inc x) y] [(dec x) y] [x (inc y)] [x (dec y)]]))
 
 (deftest initial-map-layout-test
@@ -43,12 +45,17 @@
                                             neighbor))]
                       (if (empty? next-cells) visited
                           (recur (into visited next-cells) next-cells))))]
-    (is (= {:tree 18 :stone 12 :house 3} (frequencies (vals objects))))
-    (is (= 33 (count objects)))
+    (is (= objects (layout/generate-objects)))
+    (is (<= 200 (:tree (frequencies (vals objects)))))
+    (is (<= 100 (:stone (frequencies (vals objects)))))
+    (is (= 3 (:house (frequencies (vals objects)))))
+    (is (= 33 (count layout/starting-objects)))
+    (is (= layout/starting-objects (select-keys objects (keys layout/starting-objects))))
     (is (not (contains? objects [0 0])))
-    (is (= gui/map-size 12))
-    (is (every? (fn [[x y]] (and (<= 0 x 11) (<= 0 y 11))) (keys objects)))
-    (is (= (- (* 12 12) (count objects)) (count reachable)))
+    (is (= gui/map-size config/world-width 50))
+    (is (= config/world-height 50))
+    (is (every? config/in-bounds? (keys objects)))
+    (is (= (- (* config/world-width config/world-height) (count objects)) (count reachable)))
     (doseq [[position object] objects :when (#{:tree :stone} object)]
       (is (some reachable (neighbors position)) (str "Resource accessible at " position)))))
 
@@ -72,11 +79,44 @@
 
 (deftest map-boundaries-test
   (doseq [[x y direction] [[0 0 :up] [0 0 :left]
-                           [11 11 :down] [11 11 :right]]]
+                           [(dec config/world-width) (dec config/world-height) :down]
+                           [(dec config/world-width) (dec config/world-height) :right]]]
     (place-player! 1 x y)
     (let [before (world/get-world)]
       (is (nil? (world/move-player 1 direction)))
       (is (= before (world/get-world))))))
+
+(deftest movement-at-new-world-edges-test
+  (dosync (alter world/world assoc :objects {}))
+  (place-player! 1 (- config/world-width 2) (dec config/world-height))
+  (is (true? (world/move-player 1 :right)))
+  (is (= [(dec config/world-width) (dec config/world-height)]
+         ((juxt :x :y) (get-in (world/get-world) [:players 1]))))
+  (is (= :out-of-bounds (:code (world/move-player-result 1 :right))))
+  (is (= :out-of-bounds (:code (world/move-player-result 1 :down))))
+  (is (true? (world/move-player 1 :up)))
+  (is (true? (world/move-player 1 :left))))
+
+(deftest large-world-resource-distribution-test
+  (doseq [qy [0 25] qx [0 25]]
+    (let [objects (for [[[x y] object] world/initial-objects
+                        :when (and (<= qx x (+ qx 24)) (<= qy y (+ qy 24)))] object)]
+      (is (<= 30 (count (filter #{:tree} objects))))
+      (is (<= 20 (count (filter #{:stone} objects))))))
+  (is (= layout/decorations (layout/generate-decorations)))
+  (is (every? config/in-bounds? (keys layout/decorations))))
+
+(deftest gather-and-restore-at-far-edge-test
+  (let [position [(dec config/world-width) (dec config/world-height)]]
+    (dosync (alter world/world assoc :objects {position :stone}))
+    (place-player! 1 (- config/world-width 2) (dec config/world-height))
+    (is (nil? (world/move-player 1 :right)))
+    (is (= :ok (:status (world/gather-resource 1))))
+    (is (true? (world/move-player 1 :right)))
+    (is (= :occupied (world/restore-resource position :stone)))
+    (is (true? (world/move-player 1 :left)))
+    (is (= :restored (world/restore-resource position :stone)))
+    (is (= {:wood 0 :stone 1} (get-in (world/get-world) [:players 1 :collected])))))
 
 (deftest unknown-player-test
   (is (nil? (world/move-player 99 :right)))
@@ -236,10 +276,11 @@
 
 (deftest spawn-search-in-row-order-test
   (dosync (alter world/world assoc :objects {[0 0] :tree [1 0] :stone [2 0] :house}))
-  (doseq [id (range 1 15)] (is (true? (world/add-player id (str id)))))
-  (is (= (vec (take 14 (for [y (range 12) x (range 12)
+  (doseq [id (range 1 (+ config/world-width 3))] (is (true? (world/add-player id (str id)))))
+  (is (= (vec (take (+ config/world-width 2) (for [y (range config/world-height) x (range config/world-width)
                              :when (not (#{[0 0] [1 0] [2 0]} [x y]))] [x y])))
-         (mapv #(let [p (get-in (world/get-world) [:players %])] [(:x p) (:y p)]) (range 1 15)))))
+         (mapv #(let [p (get-in (world/get-world) [:players %])] [(:x p) (:y p)])
+               (range 1 (+ config/world-width 3))))))
 
 (deftest gathered-cell-becomes-passable-test
   (place-player! 1 2 4)

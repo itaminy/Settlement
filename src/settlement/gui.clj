@@ -1,36 +1,46 @@
 (ns settlement.gui
   (:require [settlement.client :as client]
+            [settlement.config :as config]
             [settlement.rendering :as rendering])
   (:import [javax.swing JFrame JPanel JLabel SwingUtilities
             AbstractAction KeyStroke Timer JOptionPane]
-           [java.awt Color Dimension BorderLayout FlowLayout Font RenderingHints GraphicsEnvironment]
+           [java.awt Color Dimension BorderLayout FlowLayout Font GraphicsEnvironment]
            [java.awt.event ActionListener KeyEvent WindowAdapter]))
 
 (def map-size rendering/map-size)
 
 (defn update-map [panel players objects]
-  (.putClientProperty panel ::scene (rendering/render-scene players objects))
+  (.putClientProperty panel ::state {:players players :objects objects})
   (.repaint panel))
 
-(defn create-map-panel [_player-x _player-y]
-  (let [panel
-        (proxy [JPanel] []
-          (paintComponent [graphics]
-            (proxy-super paintComponent graphics)
-            (when-let [image (.getClientProperty this ::scene)]
-              (let [size (min (.getWidth this) (.getHeight this))
-                    x (quot (- (.getWidth this) size) 2)
-                    y (quot (- (.getHeight this) size) 2)
-                    drawing (.create graphics)]
-                (try
-                  (.setRenderingHint drawing RenderingHints/KEY_INTERPOLATION
-                                     RenderingHints/VALUE_INTERPOLATION_NEAREST_NEIGHBOR)
-                  (.drawImage drawing image x y size size nil)
-                  (finally (.dispose drawing)))))))]
-    (.setBackground panel (Color. 40 55 35))
-    (.setPreferredSize panel (Dimension. rendering/canvas-size rendering/canvas-size))
-    (update-map panel {} {})
-    panel))
+(defn create-map-panel
+  ([player-x player-y] (create-map-panel player-x player-y nil))
+  ([player-x player-y player-id]
+   (let [panel
+         (proxy [JPanel] []
+           (paintComponent [graphics]
+             (proxy-super paintComponent graphics)
+             (when-let [state (.getClientProperty this ::state)]
+               (let [local-id (.getClientProperty this ::player-id)
+                     player (get-in state [:players local-id] {:x player-x :y player-y})
+                     camera (rendering/camera player (.getWidth this) (.getHeight this))
+                     key [state camera]
+                     cached (.getClientProperty this ::render-cache)
+                     image (if (= key (:key cached))
+                             (:image cached)
+                             (let [image (rendering/render-scene (:players state) (:objects state) camera)]
+                               (.putClientProperty this ::render-cache {:key key :image image})
+                               image))]
+                 (.putClientProperty this ::camera camera)
+                 (.putClientProperty this ::scene image)
+                 (.drawImage graphics image
+                             (quot (- (.getWidth this) (:width camera)) 2)
+                             (quot (- (.getHeight this) (:height camera)) 2) nil)))))]
+     (.putClientProperty panel ::player-id player-id)
+     (.setBackground panel (Color. 40 55 35))
+     (.setPreferredSize panel (Dimension. config/viewport-width config/viewport-height))
+     (update-map panel {} {})
+     panel)))
 
 (defn bind-key [panel connection player-id key-code direction]
   (let [input-map (.getInputMap panel JPanel/WHEN_IN_FOCUSED_WINDOW)
@@ -178,7 +188,7 @@
   (let [frame (JFrame. "Settlement")
         response (client/request connection {:type :state})
         player (get-in response [:world :players player-id])
-        map-panel (create-map-panel (:x player) (:y player))
+        map-panel (create-map-panel (:x player) (:y player) player-id)
         resource-ui (create-resource-panel (player-resources (:world response) player-id))
         timer (start-map-updater map-panel connection resource-ui player-id)]
     (doseq [[key direction] [[KeyEvent/VK_UP :up] [KeyEvent/VK_DOWN :down]

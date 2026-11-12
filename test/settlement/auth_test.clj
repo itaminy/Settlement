@@ -4,6 +4,7 @@
             [clojure.java.io :as io]
             [settlement.auth :as auth]
             [settlement.world :as world]
+            [settlement.config :as config]
             [settlement.server :as server]
             [settlement.client :as client]
             [settlement.gui :as gui]
@@ -96,7 +97,7 @@
 (defn- fill-map-except! [free-positions]
   (dosync
     (alter world/world assoc :objects
-           (into {} (for [y (range 12) x (range 12)
+           (into {} (for [y (range config/world-height) x (range config/world-width)
                           :when (not (free-positions [x y]))]
                       [[x y] :house])))))
 

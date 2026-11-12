@@ -1,16 +1,8 @@
-(ns settlement.world)
+(ns settlement.world
+  (:require [settlement.config :as config]
+            [settlement.layout :as layout]))
 
-;; Постоянная начальная раскладка: 18 деревьев, 12 камней и 3 дома.
-(def initial-objects
-  {[3 4] :tree  [5 5] :tree  [2 1] :tree  [5 1] :tree
-   [9 1] :tree  [1 3] :tree  [5 3] :tree  [9 3] :tree
-   [7 4] :tree  [10 5] :tree [1 7] :tree  [3 7] :tree
-   [7 7] :tree  [10 7] :tree [2 9] :tree  [5 9] :tree
-   [9 9] :tree  [7 10] :tree
-   [7 2] :stone [1 1] :stone [10 2] :stone [3 2] :stone
-   [2 5] :stone [8 5] :stone [5 7] :stone  [11 8] :stone
-   [1 10] :stone [4 10] :stone [9 11] :stone [11 10] :stone
-   [8 6] :house [6 8] :house [3 10] :house})
+(def initial-objects layout/initial-objects)
 
 ;; Общее состояние игрового мира
 (def world
@@ -26,8 +18,8 @@
 (defn player-at? [state position]
   (boolean (some #(= position [(:x %) (:y %)]) (vals (:players state)))))
 
-(defn free-cell? [state [x y :as position]]
-  (and (<= 0 x 11) (<= 0 y 11)
+(defn free-cell? [state position]
+  (and (config/in-bounds? position)
        (not (contains? (:objects state) position))
        (not (player-at? state position))))
 
@@ -35,7 +27,7 @@
 (defn add-player [player-id name]
   (dosync
     (when-not (contains? (:players @world) player-id)
-      (when-let [[x y] (first (for [y (range 12) x (range 12)
+      (when-let [[x y] (first (for [y (range config/world-height) x (range config/world-width)
                                     :when (free-cell? @world [x y])] [x y]))]
         (alter world assoc-in [:players player-id]
                {:name name :x x :y y :collected {:wood 0 :stone 0}})
@@ -73,7 +65,7 @@
               x (+ (:x player) dx) y (+ (:y player) dy)
               position [x y]]
           (cond
-            (not (and (<= 0 x 11) (<= 0 y 11)))
+            (not (config/in-bounds? position))
             (fail :out-of-bounds "Destination is outside the map")
             (contains? (:objects state) position)
             (fail :object-blocked "Destination is occupied by an object")
