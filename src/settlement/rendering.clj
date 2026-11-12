@@ -118,6 +118,62 @@
         (.drawImage graphics ^BufferedImage (:dirt @terrain-tiles) (* x tile-size) (* y tile-size) nil))
       (finally (.setClip graphics clip)))))
 
+(def grass-patterns
+  {:short ["   m l   " " l ml m  " " mdmdmdm " "  dmmdm  " "   ddd   "]
+   :tall ["    l    " " l  m    " " m  m l  " " md m m  " "  mmm m l"
+          "l dmmdm m" "m  mmmmmd" " d dmmdm " "   dddd  "]
+   :clump ["  l    l    " "  m l  m  l " "l mdm lmd m " "m mmm mmmmd "
+           " mdmmmdmmmdm" "  dmmdmmmd  " "   ddddd    "]})
+
+(defn- make-grass-sprite [rows]
+  (let [width (apply max (map count rows)) height (count rows)
+        image (BufferedImage. width height BufferedImage/TYPE_INT_ARGB)
+        colors {\d (Color. 55 98 39) \m (Color. 91 130 49) \l (Color. 144 167 76)}]
+    (doseq [[y row] (map-indexed vector rows) [x pixel] (map-indexed vector row)
+            :let [color (colors pixel)] :when color]
+      (.setRGB image x y (.getRGB ^Color color)))
+    (scale-image image (* 2 width) (* 2 height))))
+
+(def grass-sprites (into {} (for [[kind rows] grass-patterns] [kind (make-grass-sprite rows)])))
+
+(defn grass-for-cell
+  "Pure client-side decoration, independent of world state and generation order."
+  [[x y :as position]]
+  (if (or (not (config/in-bounds? position)) (layout/house-clearance? position)) []
+    (let [random (java.util.Random. (long (+ 734111 (* x 73856093) (* y 19349663))))
+          ground ^Area @dirt-shape
+          density (cond (layout/clearing? position) 0.92 (layout/forest? position) 0.44 :else 0.67)]
+      (vec
+       (for [_ (range 9)
+             :let [foot-x (+ (* x tile-size) 12 (.nextInt random 41))
+                   foot-y (+ (* y tile-size) 18 (.nextInt random 41))
+                   inside? (.contains ground (double foot-x) (double foot-y))
+                   edge? (some #(not= inside? (.contains ground (double (+ foot-x (first %)))
+                                                               (double (+ foot-y (second %)))))
+                               [[-9 0] [9 0] [0 -9] [0 9]])
+                   chance (cond (and inside? edge?) 0.07 inside? 0.004 edge? 0.96 :else density)
+                   roll (.nextDouble random)
+                   variant (.nextInt random 4)
+                   kind (if inside? :short (case variant 0 :tall 1 :clump :short))
+                   image ^BufferedImage (grass-sprites kind)]
+             :when (< roll chance)]
+         {:kind kind :cell position :x (- foot-x (quot (.getWidth image) 2))
+          :y (- foot-y (.getHeight image)) :width (.getWidth image) :height (.getHeight image)
+          :on-dirt? inside? :edge? (boolean edge?)})))))
+
+;; Ограниченный числом клеток мира кэш; камера запрашивает только видимые клетки.
+(def cached-grass-for-cell (memoize grass-for-cell))
+
+(defn visible-grass [objects camera]
+  (for [position (visible-cells camera 0)
+        :when (not (contains? objects position))
+        patch (cached-grass-for-cell position)
+        :when (intersects? camera patch)] patch))
+
+(defn- draw-grass! [graphics objects camera]
+  (doseq [{:keys [kind x y]} (visible-grass objects camera)]
+    (.drawImage graphics ^BufferedImage (grass-sprites kind) (int x) (int y) nil)))
+
 (defn sprite-kind [[x y] object]
   (let [alternate? (odd? (+ x y))]
     (case object
@@ -170,6 +226,7 @@
       (.setRenderingHint graphics RenderingHints/KEY_INTERPOLATION RenderingHints/VALUE_INTERPOLATION_NEAREST_NEIGHBOR)
       (.translate graphics (- (:x camera)) (- (:y camera)))
       (draw-terrain! graphics camera)
+      (draw-grass! graphics objects camera)
       (doseq [{:keys [image x y]} (scene-sprites objects camera)]
         (.drawImage graphics ^BufferedImage image (int x) (int y) nil))
       ;; Маркеры рисуются поверх крон и крыш, чтобы игрок не терялся за ними.

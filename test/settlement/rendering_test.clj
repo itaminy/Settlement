@@ -4,7 +4,8 @@
             [settlement.rendering :as rendering]
             [settlement.world :as world]
             [settlement.config :as config]
-            [settlement.layout :as layout])
+            [settlement.layout :as layout]
+            [settlement.test-support :as support])
   (:import [java.awt Color]
            [java.awt.image BufferedImage]
            [java.util Arrays]))
@@ -187,3 +188,87 @@
                     (let [image (.getClientProperty panel :settlement.gui/scene)]
                       [(.getWidth image) (.getHeight image)])))
              (finally (.dispose graphics)))))))))
+
+(deftest grass-variants-and-reproducibility-test
+  (is (= #{:short :tall :clump} (set (keys rendering/grass-sprites))))
+  (doseq [[_ image] rendering/grass-sprites]
+    (is (<= (.getWidth image) 24))
+    (is (<= (.getHeight image) 18))
+    (is (some zero? (map #(unsigned-bit-shift-right % 24) (pixels image))))
+    (is (some pos? (map #(unsigned-bit-shift-right % 24) (pixels image)))))
+  (let [cells [[22 24] [8 10] [28 24] [0 0] [49 49]]
+        forward (into {} (map #(vector % (rendering/grass-for-cell %)) cells))
+        reverse-order (into {} (map #(vector % (rendering/grass-for-cell %)) (reverse cells)))]
+    (is (= forward reverse-order))
+    (is (= forward (into {} (map #(vector % (rendering/cached-grass-for-cell %)) cells)))))
+  (doseq [cell [[0 0] [49 49] [22 24]] patch (rendering/grass-for-cell cell)]
+    (let [[cx cy] cell {:keys [x y width height]} patch]
+      (is (<= (* cx config/tile-size) x (- (* (inc cx) config/tile-size) width)))
+      (is (<= (* cy config/tile-size) y (- (* (inc cy) config/tile-size) height))))))
+
+(deftest grass-density-and-path-edges-test
+  (let [cells (for [y (range config/world-height) x (range config/world-width)
+                    :let [p [x y]]
+                    :when (and (not (layout/house-clearance? p))
+                               (not (contains? layout/initial-objects p)))] p)
+        patches (vec (mapcat rendering/cached-grass-for-cell cells))
+        mean-count (fn [predicate]
+                     (let [group (filter #(and (predicate %) (not (apply layout/dirt? %))) cells)]
+                       (/ (reduce + (map #(count (rendering/cached-grass-for-cell %)) group))
+                          (double (count group)))))
+        dirt-count (count (filter :on-dirt? patches))]
+    (is (> (count patches) 8000))
+    (is (> (mean-count layout/clearing?) (mean-count layout/forest?)))
+    (is (< dirt-count (* 0.02 (count patches))))
+    (is (> (count (filter #(and (:edge? %) (not (:on-dirt? %))) patches)) 150))
+    (is (not-any? #(layout/house-clearance? (:cell %)) patches))))
+
+(deftest grass-is-culled-to-camera-test
+  (let [camera (rendering/camera {:x 23 :y 25} 800 600)
+        cells (atom []) original rendering/cached-grass-for-cell]
+    (with-redefs [rendering/cached-grass-for-cell (fn [cell] (swap! cells conj cell) (original cell))]
+      (let [patches (vec (rendering/visible-grass {} camera))]
+        (is (= (set (rendering/visible-cells camera 0)) (set @cells)))
+        (is (< (count @cells) 200))
+        (is (every? #(rendering/intersects? camera %) patches))
+        (is (seq patches))))))
+
+(deftest grass-does-not-cover-object-sprites-test
+  (with-redefs [rendering/decorations {}]
+    (let [objects {[24 24] :house [20 20] :tree [27 22] :stone}
+          camera (rendering/camera {:x 24 :y 24} 800 600)
+          rendered (rendering/render-scene {} objects camera)]
+      (doseq [[position kind] objects]
+        (let [{:keys [image x y width height]} (rendering/sprite-placement position (rendering/sprite-kind position kind))
+              sprite image
+              samples (for [sy (range height) sx (range width)
+                            :let [color (.getRGB ^BufferedImage sprite sx sy)
+                                  px (- (+ x sx) (:x camera)) py (- (+ y sy) (:y camera))]
+                            :when (and (= 255 (bit-and 255 (unsigned-bit-shift-right color 24)))
+                                       (<= 0 px (dec (:width camera))) (<= 0 py (dec (:height camera))))]
+                        [px py color])]
+          (is (seq samples))
+          (is (every? (fn [[px py color]] (= color (.getRGB rendered px py))) samples)))))))
+
+(deftest grass-preserves-layout-movement-and-mining-test
+  (let [composition [layout/initial-objects layout/road-cells layout/house-positions
+                     layout/spawn-position layout/decorations]
+        [gx gy :as grass-cell] (first (for [y (range 22 29) x (range 20 27)
+                                           :when (seq (rendering/grass-for-cell [x y]))] [x y]))]
+    (with-redefs [world/world (ref {:players {} :objects {[(inc gx) gy] :tree} :resources {:wood 0 :stone 0}})
+                  world/gathering (ref {}) world/now-ns #(deref support/time-ns)
+                  world/schedule-resource-restore (fn [& _] nil)]
+      (world/add-player 1 "A")
+      (dosync (alter world/world update-in [:players 1] assoc :x (dec gx) :y gy))
+      (let [before (world/get-world)
+            camera (rendering/camera {:x gx :y gy} 800 600)]
+        (is (seq (rendering/grass-for-cell grass-cell)))
+        (rendering/render-scene (:players before) (:objects before) camera)
+        (is (= before (world/get-world)))
+        (is (true? (world/move-player 1 :right)))
+        (is (= :object-blocked (:code (world/move-player-result 1 :right))))
+        (is (= :ok (:status (support/gather! 1))))
+        (is (= 1 (get-in (world/get-world) [:players 1 :inventory :items :wood])))
+        (is (true? (world/move-player 1 :right)))))
+    (is (= composition [layout/initial-objects layout/road-cells layout/house-positions
+                        layout/spawn-position layout/decorations]))))
