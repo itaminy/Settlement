@@ -1,5 +1,6 @@
 (ns settlement.world-test
   (:require [clojure.test :refer :all]
+            [settlement.server :as server]
             [settlement.world :as world]))
 
 ;; Запуск: clojure -M -m settlement.world-test fast (или slow, all).
@@ -65,6 +66,49 @@
   (is (= {:wood 5 :stone 2} (get-in (world/get-world) [:players 1 :collected])))
   (is (= {:wood 3 :stone 0} (get-in (world/get-world) [:players 2 :collected])))
   (is (= (:objects initial-world) (:objects (world/get-world)))))
+
+(deftest network-collect-rejected-test
+  ;; Проверяем отказ и рядом с ресурсом, и при ненулевом запасе.
+  (place-player! 1 2 4)
+  (world/collect-resource 1 :wood 5)
+  (world/collect-resource 1 :stone 3)
+  (doseq [resource [:wood :stone]
+          amount [1 0 -1 -1000000000 1000000000 999999999999999999999999N]]
+    (testing (str resource " amount=" amount)
+      (let [before (world/get-world)
+            response (server/process-message
+                      {:type :collect :player-id 1
+                       :resource resource :amount amount})]
+        (is (= :error (:status response)))
+        (is (= before (world/get-world)))))))
+
+(deftest network-gather-test
+  (doseq [[id x y position resource object]
+          [[1 2 4 [3 4] :wood :tree] [2 6 2 [7 2] :stone :stone]]]
+    (place-player! id x y)
+    (let [before (world/get-world)
+          scheduled (atom [])]
+      (with-redefs [world/schedule-resource-restore
+                    (fn [pos obj] (swap! scheduled conj [pos obj]))]
+        ;; Количество и тип добычи определяет сервер, даже с лишними полями.
+        (is (= {:status :ok :resource resource :amount 1 :position position}
+               (server/process-message
+                {:type :gather :player-id id :resource :gold :amount 1000000000})))
+        (is (= (update (:resources before) resource inc)
+               (:resources (world/get-world))))
+        (is (= {:wood (if (= resource :wood) 1 0)
+                :stone (if (= resource :stone) 1 0)}
+               (get-in (world/get-world) [:players id :collected])))
+        (is (= (dissoc (:objects before) position) (:objects (world/get-world))))
+        (is (= [[position object]] @scheduled))
+        (let [after (world/get-world)]
+          (is (= :error (:status (server/process-message {:type :gather :player-id id}))))
+          (is (= after (world/get-world)))
+          (is (= 1 (count @scheduled)))))))
+  (place-player! 3 0 0)
+  (let [before (world/get-world)]
+    (is (= :error (:status (server/process-message {:type :gather :player-id 3}))))
+    (is (= before (world/get-world)))))
 
 (deftest gather-tree-and-stone-test
   (doseq [[position resource player-position]

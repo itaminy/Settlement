@@ -8,7 +8,7 @@
             OutputStreamWriter]))
 
 (defn process-message [message]
-  (let [{:keys [type player-id name resource amount]} message]
+  (let [{:keys [type player-id name]} message]
     (case type
       :gather
       (world/gather-resource (:player-id message))
@@ -20,11 +20,8 @@
          :message "Player registered"})
 
       :collect
-      (if (world/collect-resource player-id resource amount)
-        {:status :ok
-         :world (world/get-world)}
-        {:status :error
-         :message "Player not found"})
+      {:status :error
+       :message "Direct resource collection is disabled; use :gather"}
 
       :move
       (if (world/move-player player-id (:direction message))

@@ -42,15 +42,6 @@
                         :player-id 1
                         :name "Kirill"}))
 
-    ;; Добыча дерева
-    (println "Collecting wood:")
-    (prn (send-message writer
-                       reader
-                       {:type :collect
-                        :player-id 1
-                        :resource :wood
-                        :amount 5}))
-
         ;; Проверка границы карты
     (println "Moving up:")
     (prn (send-message writer
@@ -66,6 +57,14 @@
                        {:type :move
                         :player-id 1
                         :direction :right}))
+
+    ;; Подходим к дереву [3 4]: после предыдущего шага игрок в [1 0].
+    (doseq [direction [:right :down :down :down :down]]
+      (prn (send-message writer reader
+                         {:type :move :player-id 1 :direction direction})))
+
+    (println "Gathering nearby resource:")
+    (prn (send-message writer reader {:type :gather :player-id 1}))
 
     ;; Получение состояния мира
     (println "World state:")
