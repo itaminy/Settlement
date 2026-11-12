@@ -1,6 +1,7 @@
 (ns settlement.client
   (:require [settlement.protocol :as protocol]
-            [settlement.credentials :as credentials])
+            [settlement.credentials :as credentials]
+            [settlement.transport :as transport])
   (:import [java.net Socket]
            [java.io BufferedReader
             InputStreamReader
@@ -12,22 +13,38 @@
   (.flush writer)
   (protocol/read-message (.readLine reader)))
 
+(declare request)
+
 (defn connect []
-  (let [socket (Socket. "127.0.0.1" 5000)
+  (let [socket (doto (Socket.)
+                 (.connect (java.net.InetSocketAddress. "127.0.0.1" 5000) 5000)
+                 (.setSoTimeout 5000))
         reader (BufferedReader.
                 (InputStreamReader. (.getInputStream socket) "UTF-8"))
         writer (BufferedWriter.
                 (OutputStreamWriter. (.getOutputStream socket) "UTF-8"))]
 
-    {:socket socket
-     :reader reader
-     :writer writer}))
+    (let [connection {:socket socket :reader reader :writer writer}]
+      (assoc connection :queue (transport/create-queue #(request connection %) #(.close socket))))))
 
 (defn close-connection [connection]
-  (.close (:socket connection)))
+  (.close (:socket connection))
+  (when-let [queue (:queue connection)] (transport/stop! queue)))
   
 (defn request [connection message]
-  (send-message (:writer connection) (:reader connection) message))
+  (locking (:writer connection)
+    (send-message (:writer connection) (:reader connection) message)))
+
+(defn async!
+  ([connection key message callback] (async! connection key message callback (constantly true) false))
+  ([connection key message callback current? priority?]
+   (let [queue (:queue connection)]
+     (transport/submit! queue key message
+       (fn [response]
+         (javax.swing.SwingUtilities/invokeLater
+          #(when (and (or (not @(:closed queue)) (= :connection-failed (:code response)))
+                      (current?)) (callback response))))
+       current? priority?))))
 
 (defn authorize!
   "Callbacks receive no secrets. A failed save can be retried on the live connection."

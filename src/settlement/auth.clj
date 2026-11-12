@@ -49,5 +49,6 @@
 
 (defn disconnect! [connection]
   (dosync
+    (world/cancel-connection-gathers! connection)
     (alter state update :sessions
            (fn [sessions] (into {} (remove #(= connection (val %)) sessions))))))

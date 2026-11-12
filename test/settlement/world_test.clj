@@ -1,5 +1,6 @@
 (ns settlement.world-test
   (:require [clojure.test :refer :all]
+            [settlement.test-support :as support]
             [settlement.server :as server]
             [settlement.auth :as auth]
             [settlement.auth-test]
@@ -9,7 +10,9 @@
             [settlement.config :as config]
             [settlement.layout :as layout]
             [settlement.inventory :as inventory]
-            [settlement.inventory-test]))
+            [settlement.inventory-test]
+            [settlement.mechanics-test]
+            [settlement.transport-test]))
 
 ;; Запуск: clojure -M -m settlement.world-test fast (или slow, all).
 (def ^:private initial-world
@@ -22,7 +25,9 @@
 (use-fixtures :each
   (fn [test-fn]
     ;; Исходный ref не меняется. Быстрые тесты не оставляют фоновых задач.
-    (with-redefs [world/world (ref initial-world)
+    (with-redefs [world/gathering (ref {})
+                  world/now-ns #(deref support/time-ns)
+                  world/world (ref initial-world)
                   auth/state (ref (auth/new-state))
                   world/schedule-resource-restore (fn [_ _] nil)]
       (test-fn))))
@@ -113,7 +118,7 @@
     (dosync (alter world/world assoc :objects {position :stone}))
     (place-player! 1 (- config/world-width 2) (dec config/world-height))
     (is (nil? (world/move-player 1 :right)))
-    (is (= :ok (:status (world/gather-resource 1))))
+    (is (= :ok (:status (support/gather! 1))))
     (is (true? (world/move-player 1 :right)))
     (is (= :occupied (world/restore-resource position :stone)))
     (is (true? (world/move-player 1 :left)))
@@ -124,7 +129,7 @@
   (is (nil? (world/move-player 99 :right)))
   (is (nil? (world/collect-resource 99 :wood 5)))
   (is (= {:status :error :message "Player not found"}
-         (world/gather-resource 99)))
+         (support/gather! 99)))
   (is (= initial-world (world/get-world))))
 
 (deftest resource-accounting-test
@@ -147,7 +152,7 @@
           amount [1 0 -1 -1000000000 1000000000 999999999999999999999999N]]
     (testing (str resource " amount=" amount)
       (let [before (world/get-world)
-            response (server/process-message
+            response (support/process-message
                       {:type :collect :player-id 1
                        :resource resource :amount amount})]
         (is (= :error (:status response)))
@@ -164,7 +169,7 @@
                     (fn [pos obj] (swap! scheduled conj [pos obj]))]
         ;; Количество и тип добычи определяет сервер, даже с лишними полями.
         (is (= {:status :ok :resource resource :amount 1 :position position}
-               (server/process-message id
+               (support/process-message id
                 {:type :gather :player-id id :resource :gold :amount 1000000000})))
         (is (= (update (:resources before) resource inc)
                (:resources (world/get-world))))
@@ -174,12 +179,12 @@
         (is (= (dissoc (:objects before) position) (:objects (world/get-world))))
         (is (= [[position object]] @scheduled))
         (let [after (world/get-world)]
-          (is (= :error (:status (server/process-message id {:type :gather :player-id id}))))
+          (is (= :error (:status (support/process-message id {:type :gather :player-id id}))))
           (is (= after (world/get-world)))
           (is (= 1 (count @scheduled)))))))
   (place-player! 3 0 0)
   (let [before (world/get-world)]
-    (is (= :error (:status (server/process-message {:type :gather :player-id 3}))))
+    (is (= :error (:status (support/process-message {:type :gather :player-id 3}))))
     (is (= before (world/get-world)))))
 
 (deftest gather-tree-and-stone-test
@@ -193,7 +198,7 @@
         (let [before (world/get-world)
               object (get-in before [:objects position])]
           (is (= {:status :ok :resource resource :amount 1 :position position}
-                 (world/gather-resource 1)))
+                 (support/gather! 1)))
           (is (= (update (:resources before) resource inc)
                  (:resources (world/get-world))))
           (is (= (update (get-in before [:players 1 :collected]) resource inc)
@@ -202,7 +207,7 @@
           (is (= [[position object]] @scheduled))
           (let [after (world/get-world)]
             (is (= {:status :error :message "No resource nearby"}
-                   (world/gather-resource 1)))
+                   (support/gather! 1)))
             (is (= after (world/get-world)))
             (is (= 1 (count @scheduled)))))))))
 
@@ -212,7 +217,7 @@
     (place-player! 1 x y)
     (let [before (world/get-world)]
       (is (= {:status :error :message "No resource nearby"}
-             (world/gather-resource 1)))
+             (support/gather! 1)))
       (is (= before (world/get-world))))))
 
 (deftest restore-resource-test
@@ -241,7 +246,7 @@
     (place-player! 1 1 2)
     (dosync (alter auth/state assoc-in [:sessions 1] :a))
     (let [before (world/get-world)
-          response (server/process-message :a {:type :move :player-id 1 :direction :right})]
+          response (support/process-message :a {:type :move :player-id 1 :direction :right})]
       (is (= :error (:status response)))
       (is (= :object-blocked (:code response)))
       (is (seq (:message response)))
@@ -288,7 +293,7 @@
   (place-player! 1 2 4)
   (place-player! 2 0 0)
   (is (nil? (world/move-player 1 :right)))
-  (is (= :ok (:status (world/gather-resource 1))))
+  (is (= :ok (:status (support/gather! 1))))
   (is (true? (world/move-player 1 :right)))
   (is (= [3 4] ((juxt :x :y) (get-in (world/get-world) [:players 1]))))
   (is (= {:wood 1 :stone 0} (get-in (world/get-world) [:players 1 :collected])))
@@ -299,12 +304,12 @@
           position [[1 2] [3 2] [2 1] [2 3]]]
     (dosync (alter world/world assoc :objects {[2 2] object}))
     (apply place-player! 1 position)
-    (is (= :ok (:status (world/gather-resource 1)))))
+    (is (= :ok (:status (support/gather! 1)))))
   (doseq [position [[1 1] [3 1] [1 3] [3 3] [0 2] [2 0] [4 2] [2 4]]]
     (dosync (alter world/world assoc :objects {[2 2] :tree}))
     (apply place-player! 1 position)
     (let [before (world/get-world)]
-      (is (= :error (:status (world/gather-resource 1))))
+      (is (= :error (:status (support/gather! 1))))
       (is (= before (world/get-world))))))
 
 (deftest decorations-and-large-sprites-do-not-block-test
@@ -322,7 +327,7 @@
 
 (deftest safe-restore-and-retry-test
   (place-player! 1 2 4)
-  (world/gather-resource 1)
+  (support/gather! 1)
   (world/move-player 1 :right)
   (is (= :occupied (world/restore-resource [3 4] :tree)))
   (is (nil? (get-in (world/get-world) [:objects [3 4]])))
@@ -363,31 +368,20 @@
 (deftest concurrent-gather-test
   (place-player! 1 2 4)
   (place-player! 2 4 4)
-  (let [ready (java.util.concurrent.CountDownLatch. 2)
-        start (promise)
+  (let [actions (into {} (for [id [1 2]] [id (world/start-gather! id :test (str id))]))
         scheduled (atom [])]
-    (with-redefs [world/schedule-resource-restore
-                  (fn [pos object] (swap! scheduled conj [pos object]))]
-      (let [tasks (mapv (fn [id]
-                          (future
-                            (.countDown ready)
-                            (when (= :go (deref start 5000 :timeout))
-                              (world/gather-resource id))))
-                        [1 2])]
-        (try
-          (is (.await ready 5 java.util.concurrent.TimeUnit/SECONDS))
-          (deliver start :go)
-          (let [results (mapv #(deref % 5000 :timeout) tasks)
-                state (world/get-world)]
-            (is (= {:ok 1 :error 1} (frequencies (map :status results))))
-            (is (= {:wood 1 :stone 0} (:resources state)))
-            (is (= [0 1] (sort (map #(get-in state [:players % :collected :wood]) [1 2]))))
-            (is (every? zero? (map #(get-in state [:players % :collected :stone]) [1 2])))
-            (is (= (dissoc (:objects initial-world) [3 4]) (:objects state)))
-            (is (= [[[3 4] :tree]] @scheduled)))
-          (finally
-            (deliver start :cancel)
-            (doseq [task tasks] (future-cancel task))))))))
+    (dotimes [_ 12]
+      (support/advance! 250)
+      (doseq [id [1 2]] (world/update-gather! id :test (:operation-id (actions id)) false)))
+    (with-redefs [world/schedule-resource-restore (fn [pos object] (swap! scheduled conj [pos object]))]
+      (let [results (concurrently [#(world/update-gather! 1 :test (:operation-id (actions 1)) true)
+                                   #(world/update-gather! 2 :test (:operation-id (actions 2)) true)])
+            state (world/get-world)]
+        (is (= {:ok 1 :error 1} (frequencies (map :status results))))
+        (is (= {:wood 1 :stone 0} (:resources state)))
+        (is (= [0 1] (sort (map #(get-in state [:players % :collected :wood]) [1 2]))))
+        (is (= (dissoc (:objects initial-world) [3 4]) (:objects state)))
+        (is (= [[[3 4] :tree]] @scheduled))))))
 
 (deftest ^:slow scheduled-restore-after-30-seconds-test
   (place-player! 1 2 4)
@@ -400,12 +394,12 @@
                       (swap! tasks conj task)
                       task))]
       (try
-        (is (= :ok (:status (world/gather-resource 1))))
-        (is (= :ok (:status (world/gather-resource 2))))
+        (is (= :ok (:status (support/gather! 1))))
+        (is (= :ok (:status (support/gather! 2))))
         (is (nil? (get-in (world/get-world) [:objects [3 4]])))
         (is (nil? (get-in (world/get-world) [:objects [7 2]])))
-        (is (= :error (:status (world/gather-resource 1))))
-        (is (= :error (:status (world/gather-resource 2))))
+        (is (= :error (:status (support/gather! 1))))
+        (is (= :error (:status (support/gather! 2))))
         (is (= 2 (count @tasks)))
         (is (true? (world/move-player 1 :right)))
         ;; Камень восстановится через 30 секунд; дерево ждёт ухода игрока.
@@ -422,8 +416,8 @@
         (is (= {:wood 1 :stone 1} (:resources (world/get-world))))
         (is (= {:wood 1 :stone 0} (get-in (world/get-world) [:players 1 :collected])))
         (is (= {:wood 0 :stone 1} (get-in (world/get-world) [:players 2 :collected])))
-        (is (= :ok (:status (world/gather-resource 1))))
-        (is (= :ok (:status (world/gather-resource 2))))
+        (is (= :ok (:status (support/gather! 1))))
+        (is (= :ok (:status (support/gather! 2))))
         (is (= {:wood 2 :stone 2} (:resources (world/get-world))))
         (is (= {:wood 2 :stone 0} (get-in (world/get-world) [:players 1 :collected])))
         (is (= {:wood 0 :stone 2} (get-in (world/get-world) [:players 2 :collected])))
@@ -435,7 +429,8 @@
     (when-not (#{"fast" "slow" "all"} suite)
       (throw (ex-info "Expected fast, slow or all" {:suite suite})))
     (try
-      (let [tests (->> ["settlement.world-test" "settlement.auth-test" "settlement.rendering-test" "settlement.inventory-test"]
+      (let [tests (->> ["settlement.world-test" "settlement.auth-test" "settlement.rendering-test" "settlement.inventory-test"
+                       "settlement.mechanics-test" "settlement.transport-test"]
                        (mapcat #(vals (ns-interns (symbol %))))
                        (filter #(-> % meta :test))
                        (filter #(case suite

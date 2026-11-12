@@ -10,7 +10,7 @@
 
 (defn process-message
   ([message] (process-message nil message))
-  ([connection {:keys [type player-id name token server-instance direction]}]
+  ([connection {:keys [type player-id name token server-instance direction operation-id attempt-id tool]}]
    (case type
      :hello {:status :ok :server-instance (:instance @auth/state)}
      :register (if connection (auth/register! connection player-id name)
@@ -19,12 +19,23 @@
                 (auth/failure :not-authenticated))
      :collect (auth/failure :collect-disabled)
      :state {:status :ok :world (world/get-world)}
-     (:move :gather)
+     :gather (auth/failure :gather-disabled)
+     (:move :gather-start :gather-heartbeat :gather-cancel :gather-finish :craft)
      (let [id (when connection (auth/owner connection))]
        (cond
          (nil? id) (auth/failure :not-authenticated)
          (not= id player-id) (auth/failure :wrong-player)
-         (= type :gather) (world/gather-resource id)
+         (= type :gather-start) (dosync (ensure auth/state)
+                                   (if (= id (auth/owner connection))
+                                     (world/start-gather! id connection attempt-id)
+                                     (auth/failure :not-authenticated)))
+         (= type :gather-heartbeat) (world/update-gather! id connection operation-id false)
+         (= type :gather-finish) (world/update-gather! id connection operation-id true)
+         (= type :gather-cancel) (world/cancel-gather! id connection operation-id attempt-id)
+         (= type :craft) (dosync (ensure auth/state)
+                            (if (= id (auth/owner connection))
+                              (assoc (world/craft! id tool) :world (world/get-world))
+                              (auth/failure :not-authenticated)))
          :else (let [result (world/move-player-result id direction)]
                  (if (= :ok (:status result))
                    (assoc result :world (world/get-world))

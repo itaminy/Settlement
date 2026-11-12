@@ -1,5 +1,6 @@
 (ns settlement.auth-test
   (:require [clojure.test :refer :all]
+            [settlement.test-support :as support]
             [clojure.string :as str]
             [clojure.java.io :as io]
             [settlement.auth :as auth]
@@ -18,7 +19,9 @@
     (let [directory (.toFile (Files/createTempDirectory "settlement-test-" (make-array FileAttribute 0)))]
       (try
         (binding [credentials/*credentials-file* (str (io/file directory "credentials.edn"))]
-          (with-redefs [world/world (ref {:players {} :resources {:wood 0 :stone 0}
+          (with-redefs [world/gathering (ref {})
+                  world/now-ns #(deref support/time-ns)
+                  world/world (ref {:players {} :resources {:wood 0 :stone 0}
                                          :objects {[1 0] :tree [3 0] :stone}})
                         auth/state (ref (auth/new-state))
                         world/schedule-resource-restore (fn [_ _] nil)]
@@ -27,10 +30,10 @@
           (doseq [file (reverse (file-seq directory))] (io/delete-file file true)))))))
 
 (defn- register [connection id]
-  (server/process-message connection {:type :register :player-id id :name (str "Player " id)}))
+  (support/process-message connection {:type :register :player-id id :name (str "Player " id)}))
 
 (defn- login [connection id registration]
-  (server/process-message connection (assoc (select-keys registration [:token :server-instance])
+  (support/process-message connection (assoc (select-keys registration [:token :server-instance])
                                            :type :login :player-id id)))
 
 (deftest registration-and-secrets-test
@@ -44,7 +47,7 @@
     (is (= :error (:status (register :a 1))))
     (is (= :error (:status (register :a 3))))
     (is (= before (world/get-world)))
-    (is (not (.contains (pr-str (server/process-message {:type :state})) (:token first))))
+    (is (not (.contains (pr-str (support/process-message {:type :state})) (:token first))))
     (is (not (.contains (pr-str @auth/state) (:token first))))
     (is (nil? (world/add-player 1 "Replacement")))
     (is (= before (world/get-world)))))
@@ -55,17 +58,17 @@
   (doseq [connection [nil :unregistered :b]
           command [{:type :move :direction :right} {:type :gather}]]
     (let [before (world/get-world)]
-      (is (= :error (:status (server/process-message connection (assoc command :player-id 1)))))
+      (is (= :error (:status (support/process-message connection (assoc command :player-id 1)))))
       (is (= before (world/get-world)))))
-  (is (= :error (:status (server/process-message :a {:type :move :direction :right}))))
-  (is (= :ok (:status (server/process-message :a {:type :gather :player-id 1}))))
-  (is (= :ok (:status (server/process-message :a {:type :move :player-id 1 :direction :down}))))
-  (is (= :ok (:status (server/process-message :b {:type :move :player-id 2 :direction :down})))))
+  (is (= :error (:status (support/process-message :a {:type :move :direction :right}))))
+  (is (= :ok (:status (support/process-message :a {:type :gather :player-id 1}))))
+  (is (= :ok (:status (support/process-message :a {:type :move :player-id 1 :direction :down}))))
+  (is (= :ok (:status (support/process-message :b {:type :move :player-id 2 :direction :down})))))
 
 (deftest reconnect-preserves-progress-test
   (let [registration (register :a 1)]
-    (server/process-message :a {:type :gather :player-id 1})
-    (server/process-message :a {:type :move :player-id 1 :direction :down})
+    (support/process-message :a {:type :gather :player-id 1})
+    (support/process-message :a {:type :move :player-id 1 :direction :down})
     (let [before (world/get-world)]
       (is (= :already-connected (:code (login :b 1 registration))))
       (auth/disconnect! :a)
@@ -155,12 +158,12 @@
     (auth/disconnect! :a)
     (register :b 2)
     (is (= [2 0] ((juxt :x :y) (get-in (world/get-world) [:players 2]))))
-    (is (= :object-blocked (:code (server/process-message :b {:type :move :player-id 2 :direction :left}))))
+    (is (= :object-blocked (:code (support/process-message :b {:type :move :player-id 2 :direction :left}))))
     ;; Клетка [1 0] занята деревом, поэтому сначала освобождаем её добычей.
-    (is (= :ok (:status (server/process-message :b {:type :gather :player-id 2}))))
-    (is (= :wood (:resource (server/process-message :b {:type :gather :player-id 2}))))
-    (is (= :ok (:status (server/process-message :b {:type :move :player-id 2 :direction :left}))))
-    (is (= :player-blocked (:code (server/process-message :b {:type :move :player-id 2 :direction :left}))))
+    (is (= :ok (:status (support/process-message :b {:type :gather :player-id 2}))))
+    (is (= :wood (:resource (support/process-message :b {:type :gather :player-id 2}))))
+    (is (= :ok (:status (support/process-message :b {:type :move :player-id 2 :direction :left}))))
+    (is (= :player-blocked (:code (support/process-message :b {:type :move :player-id 2 :direction :left}))))
     (is (= :ok (:status (login :reconnected 1 registration))))
     (is (= [0 0] ((juxt :x :y) (get-in (world/get-world) [:players 1]))))))
 
@@ -184,7 +187,7 @@
         save credentials/save-entry!
         attempts (atom 0)
         retries (atom 0)]
-    (with-redefs [client/request (fn [_ message] (server/process-message @connection message))
+    (with-redefs [client/request (fn [_ message] (support/process-message @connection message))
                   credentials/save-entry! (fn [& args]
                                             (if (= 1 (swap! attempts inc))
                                               {:status :error :code :credentials-save-failed}
@@ -194,8 +197,8 @@
                                 #(do (swap! retries inc) true))))
       (is (= 1 @retries))
       (is (= 2 @attempts))
-      (server/process-message :a {:type :gather :player-id 1})
-      (server/process-message :a {:type :move :player-id 1 :direction :down})
+      (support/process-message :a {:type :gather :player-id 1})
+      (support/process-message :a {:type :move :player-id 1 :direction :down})
       (auth/disconnect! :a)
       (reset! connection :b)
       (let [before (world/get-world)]
@@ -204,7 +207,7 @@
 
 (deftest stale-token-client-test
   (credentials/save-entry! "127.0.0.1:5000" 1 "previous-server" "old-secret")
-  (with-redefs [client/request (fn [_ message] (server/process-message :a message))]
+  (with-redefs [client/request (fn [_ message] (support/process-message :a message))]
     (is (= :cancelled (:code (client/authorize! {} 1 "Alice" (constantly false) (constantly false)))))
     (is (empty? (:players (world/get-world))))
     (is (= :ok (:status (client/authorize! {} 1 "Alice" (constantly true) (constantly false)))))
@@ -214,14 +217,14 @@
   (let [registration (register :existing 1)
         before (world/get-world)]
     (credentials/save-entry! "127.0.0.1:5000" 1 "previous-server" "old-secret")
-    (with-redefs [client/request (fn [_ message] (server/process-message :new message))]
+    (with-redefs [client/request (fn [_ message] (support/process-message :new message))]
       (is (= :player-exists (:code (client/authorize! {} 1 "Replacement" (constantly true) (constantly false))))))
     (is (= before (world/get-world)))
     (is (= "old-secret" (:token (credentials/load-entry "127.0.0.1:5000" 1))))
     (is (= :stale-server (:code (login :new 1 (assoc registration :server-instance "old")))))))
 
 (deftest save-cancel-does-not-expose-secret-test
-  (with-redefs [client/request (fn [_ message] (server/process-message :a message))
+  (with-redefs [client/request (fn [_ message] (support/process-message :a message))
                 credentials/save-entry! (fn [& _] {:status :error :code :credentials-save-failed})]
     (let [result (atom nil)
           output (with-out-str (reset! result (client/authorize! {} 1 "Alice" (constantly false) (constantly false))))]
@@ -232,10 +235,10 @@
   (register :a 1)
   (let [panel (gui/create-map-panel 0 0)
         resource-ui (gui/create-resource-panel (gui/player-resources (world/get-world) 1))]
-    (with-redefs [client/send-message (fn [_ _ message] (server/process-message :a message))]
-      (gui/bind-gather-key panel {} resource-ui 1)
+    (with-redefs [client/async! support/immediate-async]
+      (support/process-message :a {:type :gather :player-id 1})
+      (gui/update-player-panels! resource-ui (world/get-world) 1)
       (gui/bind-key panel {} 1 java.awt.event.KeyEvent/VK_RIGHT :right)
-      (.actionPerformed (.get (.getActionMap panel) "gather") nil)
       (is (= {:wood 1 :stone 0} (get-in (world/get-world) [:players 1 :collected])))
       (is (nil? (get-in (world/get-world) [:objects [1 0]])))
       (.actionPerformed (.get (.getActionMap panel) "move-right") nil)
@@ -248,7 +251,7 @@
   (register :a 1)
   (register :b 2)
   (is (= [2 0] ((juxt :x :y) (get-in (world/get-world) [:players 2]))))
-  (is (= :ok (:status (server/process-message :b {:type :gather :player-id 2}))))
+  (is (= :ok (:status (support/process-message :b {:type :gather :player-id 2}))))
   (javax.swing.SwingUtilities/invokeAndWait
    (fn []
      (let [panel-a (gui/create-map-panel 0 0)
@@ -257,10 +260,9 @@
            ui-b (gui/create-resource-panel (gui/player-resources (world/get-world) 2))]
        (is (= "Моё дерево: 0 | Мой камень: 0" (panel-text ui-a)))
        (is (= "Моё дерево: 0 | Мой камень: 1" (panel-text ui-b)))
-       (with-redefs [client/send-message (fn [connection _ message]
-                                          (server/process-message connection message))]
-         (gui/bind-gather-key panel-a {:writer :a} ui-a 1)
-         (.actionPerformed (.get (.getActionMap panel-a) "gather") nil)
+       (with-redefs [client/async! support/immediate-async]
+         (support/process-message :a {:type :gather :player-id 1})
+         (gui/update-player-panels! ui-a (world/get-world) 1)
          (is (= "Моё дерево: 1 | Мой камень: 0" (panel-text ui-a)))
          (is (= "Моё дерево: 0 | Мой камень: 1" (panel-text ui-b)))
          (let [timer-a (gui/start-map-updater panel-a {:writer :a} ui-a 1)
@@ -296,15 +298,15 @@
                                                                (constantly false) (constantly false)))]
           (is (= :ok (:status (authorize a 1))))
           (is (= :ok (:status (authorize b 2))))
-          (is (= :ok (:status (client/request a {:type :gather :player-id 1}))))
-          (client/request a {:type :move :player-id 1 :direction :down})
+          (is (= :ok (:status (support/request a {:type :gather :player-id 1}))))
+          (support/request a {:type :move :player-id 1 :direction :down})
           (is (= [2 0] ((juxt :x :y) (get-in (world/get-world) [:players 2]))))
-          (is (= :ok (:status (client/request b {:type :gather :player-id 2}))))
+          (is (= :ok (:status (support/request b {:type :gather :player-id 2}))))
           (let [before (world/get-world)
                 duplicate (open!)]
             (is (= :already-connected (:code (authorize duplicate 1))))
-            (is (= :wrong-player (:code (client/request b {:type :move :player-id 1 :direction :right}))))
-            (is (= :wrong-player (:code (client/request b {:type :gather :player-id 1}))))
+            (is (= :wrong-player (:code (support/request b {:type :move :player-id 1 :direction :right}))))
+            (is (= :wrong-player (:code (support/request b {:type :gather :player-id 1}))))
             (client/close-connection a)
             (is (not= ::timeout (deref (second (first @connections)) 5000 ::timeout)))
             (is (= :ok (:status (authorize (open!) 1))))
@@ -315,7 +317,7 @@
             (is (= {:wood 0 :stone 1} (gui/player-resources (world/get-world) 2)))
             (is (= "Моё дерево: 1 | Мой камень: 0"
                    (panel-text (gui/create-resource-panel (gui/player-resources (world/get-world) 1)))))
-            (is (= :ok (:status (client/request b {:type :move :player-id 2 :direction :down}))))))
+            (is (= :ok (:status (support/request b {:type :move :player-id 2 :direction :down}))))))
         (finally
           (doseq [[connection handler] @connections]
             (client/close-connection connection)
@@ -331,10 +333,10 @@
                       :writer (java.io.BufferedWriter. (java.io.OutputStreamWriter. (.getOutputStream socket) "UTF-8"))}]
       (.setSoTimeout socket 5000)
       (try
-        (let [registration (client/request connection {:type :register :player-id 1 :name "Alice"})]
+        (let [registration (support/request connection {:type :register :player-id 1 :name "Alice"})]
           (is (= :ok (:status registration)))
-          (is (= :ok (:status (client/request connection {:type :gather :player-id 1}))))
-          (client/request connection {:type :move :player-id 1 :direction :down})
+          (is (= :ok (:status (support/request connection {:type :gather :player-id 1}))))
+          (support/request connection {:type :move :player-id 1 :direction :down})
           (let [before (world/get-world)]
             (.close socket)
             (is (not= ::timeout (deref handler 5000 ::timeout)))

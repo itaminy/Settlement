@@ -1,5 +1,6 @@
 (ns settlement.inventory-test
   (:require [clojure.test :refer :all]
+            [settlement.test-support :as support]
             [settlement.inventory :as inventory]
             [settlement.inventory-ui :as inventory-ui]
             [settlement.world :as world]
@@ -12,14 +13,16 @@
 
 (use-fixtures :each
   (fn [f]
-    (with-redefs [world/world (ref {:players {} :resources {:wood 0 :stone 0}
+    (with-redefs [world/gathering (ref {})
+                  world/now-ns #(deref support/time-ns)
+                  world/world (ref {:players {} :resources {:wood 0 :stone 0}
                                    :objects {[1 0] :tree [3 0] :stone}})
                   auth/state (ref (auth/new-state))
                   world/schedule-resource-restore (fn [_ _] nil)]
       (f))))
 
 (defn- register! [connection id]
-  (server/process-message connection {:type :register :player-id id :name (str id)}))
+  (support/process-message connection {:type :register :player-id id :name (str id)}))
 
 (deftest empty-inventory-test
   (register! :a 1)
@@ -56,8 +59,8 @@
 (deftest independent-gathered-inventories-test
   (register! :a 1)
   (register! :b 2)
-  (is (= :ok (:status (server/process-message :a {:type :gather :player-id 1}))))
-  (is (= :ok (:status (server/process-message :b {:type :gather :player-id 2}))))
+  (is (= :ok (:status (support/process-message :a {:type :gather :player-id 1}))))
+  (is (= :ok (:status (support/process-message :b {:type :gather :player-id 2}))))
   (let [state (world/get-world)]
     (is (= {:wood 1 :stone 0 :axe 0 :pickaxe 0} (get-in state [:players 1 :inventory :items])))
     (is (= {:wood 0 :stone 1 :axe 0 :pickaxe 0} (get-in state [:players 2 :inventory :items])))
@@ -68,10 +71,10 @@
 
 (deftest reconnect-keeps-inventory-test
   (let [registration (register! :a 1)]
-    (server/process-message :a {:type :gather :player-id 1})
+    (support/process-message :a {:type :gather :player-id 1})
     (let [before (world/get-world)]
       (auth/disconnect! :a)
-      (is (= :ok (:status (server/process-message :new
+      (is (= :ok (:status (support/process-message :new
                            (merge (select-keys registration [:token :server-instance])
                                   {:type :login :player-id 1})))))
       (is (= before (world/get-world)))
@@ -85,9 +88,9 @@
                    {:type :set-inventory :player-id 1 :inventory {:items {:wood 500}}}
                    {:type :change-items :player-id 1 :changes {:axe 1}}]]
     (let [before (world/get-world)]
-      (is (= :error (:status (server/process-message :b message))))
+      (is (= :error (:status (support/process-message :b message))))
       (is (= before (world/get-world)))))
-  (server/process-message :b {:type :gather :player-id 2 :inventory {:items {:axe 99}}})
+  (support/process-message :b {:type :gather :player-id 2 :inventory {:items {:axe 99}}})
   (is (= 0 (get-in (world/get-world) [:players 2 :inventory :items :axe]))))
 
 (deftest future-cost-and-reward-validation-test
@@ -113,9 +116,9 @@
            panel (gui/create-map-panel 0 0 1)]
        (is (= 12 (count (.getComponents (:slots ui)))))
        (is (= "Свободно слотов: 12 / 12" (.getText (:free-label ui))))
-       (with-redefs [client/send-message (fn [_ _ message] (server/process-message :a message))]
-         (gui/bind-gather-key panel {} resource-ui 1)
-         (.actionPerformed (.get (.getActionMap panel) "gather") nil))
+       (with-redefs [client/async! support/immediate-async]
+         (support/process-message :a {:type :gather :player-id 1})
+         (gui/update-player-panels! resource-ui (world/get-world) 1))
        (is (= "Количество: 1" (.getText (get-in ui [:counts :wood]))))
        (is (= "Количество: 0" (.getText (get-in ui [:counts :axe]))))
        (is (= "Свободно слотов: 11 / 12" (.getText (:free-label ui))))

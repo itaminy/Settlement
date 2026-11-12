@@ -4,6 +4,7 @@
 (def item-names {:wood "Дерево" :stone "Камень" :axe "Топор" :pickaxe "Кирка"})
 (def capacity 12)
 (def empty-inventory {:items {:wood 0 :stone 0 :axe 0 :pickaxe 0}})
+(def recipes {:axe {:wood 3 :stone 2} :pickaxe {:wood 2 :stone 3}})
 
 (defn player-inventory [player]
   ;; После миграции старое поле никогда не перекрывает актуальный инвентарь.
