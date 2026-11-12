@@ -7,7 +7,9 @@
             [settlement.gui :as gui]
             [settlement.world :as world]
             [settlement.config :as config]
-            [settlement.layout :as layout]))
+            [settlement.layout :as layout]
+            [settlement.inventory :as inventory]
+            [settlement.inventory-test]))
 
 ;; Запуск: clojure -M -m settlement.world-test fast (или slow, all).
 (def ^:private initial-world
@@ -62,8 +64,8 @@
 (deftest registration-test
   (world/add-player 1 "Alice")
   (world/add-player 2 "Bob")
-  (is (= {1 {:name "Alice" :x 0 :y 0 :collected {:wood 0 :stone 0}}
-          2 {:name "Bob" :x 1 :y 0 :collected {:wood 0 :stone 0}}}
+  (is (= {1 {:name "Alice" :x 0 :y 0 :inventory inventory/empty-inventory :collected {:wood 0 :stone 0}}
+          2 {:name "Bob" :x 1 :y 0 :inventory inventory/empty-inventory :collected {:wood 0 :stone 0}}}
          (:players (world/get-world))))
   (is (= (dissoc initial-world :players)
          (dissoc (world/get-world) :players))))
@@ -433,7 +435,7 @@
     (when-not (#{"fast" "slow" "all"} suite)
       (throw (ex-info "Expected fast, slow or all" {:suite suite})))
     (try
-      (let [tests (->> ["settlement.world-test" "settlement.auth-test" "settlement.rendering-test"]
+      (let [tests (->> ["settlement.world-test" "settlement.auth-test" "settlement.rendering-test" "settlement.inventory-test"]
                        (mapcat #(vals (ns-interns (symbol %))))
                        (filter #(-> % meta :test))
                        (filter #(case suite

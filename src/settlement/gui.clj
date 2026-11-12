@@ -1,8 +1,10 @@
 (ns settlement.gui
   (:require [settlement.client :as client]
             [settlement.config :as config]
-            [settlement.rendering :as rendering])
-  (:import [javax.swing JFrame JPanel JLabel SwingUtilities
+            [settlement.rendering :as rendering]
+            [settlement.inventory :as inventory]
+            [settlement.inventory-ui :as inventory-ui])
+  (:import [javax.swing JFrame JDialog JPanel JLabel SwingUtilities
             AbstractAction KeyStroke Timer JOptionPane]
            [java.awt Color Dimension BorderLayout FlowLayout Font GraphicsEnvironment]
            [java.awt.event ActionListener KeyEvent WindowAdapter]))
@@ -70,10 +72,10 @@
 
 
 ;; Объявляем функцию обновления ресурсов
-(declare update-resource-panel)
+(declare update-resource-panel update-player-panels!)
 
 (defn player-resources [state player-id]
-  (get-in state [:players player-id :collected] {:wood 0 :stone 0}))
+  (inventory/resources (inventory/player-inventory (get-in state [:players player-id]))))
 
 ;; Добыча ресурсов по клавише E
 (defn bind-gather-key [panel connection resource-ui player-id]
@@ -105,9 +107,7 @@
 
                     (when (= :ok (:status state))
                       (update-map panel (get-in state [:world :players]) (get-in state [:world :objects]))
-                      (update-resource-panel
-                       resource-ui
-                       (player-resources (:world state) player-id)))))))))))
+                      (update-player-panels! resource-ui (:world state) player-id))))))))))
 
 
 (defn start-map-updater [panel connection resource-ui player-id]
@@ -131,7 +131,7 @@
                    (update-map panel players objects)
 
                    ;; Обновляем панель ресурсов
-                   (update-resource-panel resource-ui resources)))))))]
+                   (update-player-panels! resource-ui (:world response) player-id)))))))]
     (.start timer)
     timer))
 
@@ -166,6 +166,18 @@
   (.setText (:stone-label resource-ui)
             (str "Мой камень: " (:stone resources 0))))
 
+(defn update-player-panels! [resource-ui state player-id]
+  (let [contents (inventory/player-inventory (get-in state [:players player-id]))]
+    (update-resource-panel resource-ui (inventory/resources contents))
+    (when-let [ui (:inventory-ui resource-ui)]
+      (inventory-ui/update-panel! ui contents))))
+
+(defn bind-inventory-key [component toggle!]
+  (.put (.getInputMap component JPanel/WHEN_IN_FOCUSED_WINDOW)
+        (KeyStroke/getKeyStroke KeyEvent/VK_I 0) "inventory")
+  (.put (.getActionMap component) "inventory"
+        (proxy [AbstractAction] [] (actionPerformed [_] (toggle!)))))
+
 ;; Создание игрового окна
 (defn- confirm-dialog [message]
   (= JOptionPane/YES_OPTION
@@ -189,11 +201,28 @@
         response (client/request connection {:type :state})
         player (get-in response [:world :players player-id])
         map-panel (create-map-panel (:x player) (:y player) player-id)
-        resource-ui (create-resource-panel (player-resources (:world response) player-id))
+        inventory-panel (inventory-ui/create-panel (inventory/player-inventory player))
+        resource-ui (assoc (create-resource-panel (player-resources (:world response) player-id))
+                           :inventory-ui inventory-panel)
+        inventory-window (JDialog. frame "Инвентарь" false)
         timer (start-map-updater map-panel connection resource-ui player-id)]
     (doseq [[key direction] [[KeyEvent/VK_UP :up] [KeyEvent/VK_DOWN :down]
                              [KeyEvent/VK_LEFT :left] [KeyEvent/VK_RIGHT :right]]]
       (bind-key map-panel connection player-id key direction))
+    (.setContentPane inventory-window (:panel inventory-panel))
+    (.setDefaultCloseOperation inventory-window JDialog/HIDE_ON_CLOSE)
+    (.setResizable inventory-window false)
+    (.pack inventory-window)
+    (let [toggle! (fn []
+                    (if (.isVisible inventory-window)
+                      (do (.setVisible inventory-window false) (.requestFocusInWindow map-panel))
+                      (let [state (client/request connection {:type :state})]
+                        (when (= :ok (:status state))
+                          (update-player-panels! resource-ui (:world state) player-id))
+                        (.setLocationRelativeTo inventory-window frame)
+                        (.setVisible inventory-window true))))]
+      (bind-inventory-key map-panel toggle!)
+      (bind-inventory-key (.getRootPane inventory-window) toggle!))
     (bind-gather-key map-panel connection resource-ui player-id)
     (update-map map-panel (get-in response [:world :players]) (get-in response [:world :objects]))
     (.setDefaultCloseOperation frame JFrame/DISPOSE_ON_CLOSE)
@@ -201,6 +230,7 @@
       (proxy [WindowAdapter] []
         (windowClosed [_]
           (.stop timer)
+          (.dispose inventory-window)
           (client/close-connection connection))))
     (.setLayout (.getContentPane frame) (BorderLayout.))
     (.add (.getContentPane frame) (:panel resource-ui) BorderLayout/NORTH)

@@ -1,11 +1,12 @@
 (ns settlement.world
   (:require [settlement.config :as config]
-            [settlement.layout :as layout]))
+            [settlement.layout :as layout]
+            [settlement.inventory :as inventory]))
 
 (def initial-objects layout/initial-objects)
 
 ;; Общее состояние игрового мира
-(def world
+(defonce world
   (ref
    {:resources
     {:wood 0
@@ -14,6 +15,15 @@
     :players {}
 
     :objects initial-objects}))
+
+(defn migrate-inventories! []
+  (dosync
+    (alter world update :players
+           (fn [players] (into {} (map (fn [[id player]] [id (inventory/normalize-player player)]) players)))))
+  nil)
+
+;; defonce сохраняет мир при перезагрузке namespace в работающем сервере.
+(migrate-inventories!)
 
 (defn player-at? [state position]
   (boolean (some #(= position [(:x %) (:y %)]) (vals (:players state)))))
@@ -30,26 +40,35 @@
       (when-let [[x y] (first (for [y (range config/world-height) x (range config/world-width)
                                     :when (free-cell? @world [x y])] [x y]))]
         (alter world assoc-in [:players player-id]
-               {:name name :x x :y y :collected {:wood 0 :stone 0}})
+               {:name name :x x :y y :inventory inventory/empty-inventory})
         true))))
 
-;; Добыча ресурсов
+(defn change-player-items! [player-id changes]
+  (dosync
+    (if-let [player (get-in @world [:players player-id])]
+      (try
+        (let [player (inventory/normalize-player player)
+              updated (inventory/change-items (:inventory player) changes)]
+          (alter world assoc-in [:players player-id] (assoc player :inventory updated))
+          {:status :ok})
+        (catch clojure.lang.ExceptionInfo e
+          {:status :error :code (:code (ex-data e))}))
+      {:status :error :code :player-not-found})))
+
+;; Внутреннее начисление: сетевая команда :collect по-прежнему запрещена.
 (defn collect-resource [player-id resource amount]
   (dosync
-    (when (contains? (:players @world) player-id)
-      (alter world update-in
-             [:resources resource]
-             + amount)
-
-      (alter world update-in
-             [:players player-id :collected resource]
-             + amount)
-
+    (when (and (#{:wood :stone} resource) (integer? amount) (pos? amount)
+               (= :ok (:status (change-player-items! player-id {resource amount}))))
+      (alter world update-in [:resources resource] + amount)
       true)))
 
-;; Получение текущего состояния мира
 (defn get-world []
-  @world)
+  (update @world :players
+          (fn [players]
+            (into {} (for [[id player] players
+                           :let [player (inventory/normalize-player player)]]
+                       [id (assoc player :collected (inventory/resources (:inventory player)))])))))
 
 (defn move-player-result [player-id direction]
   (dosync
@@ -102,10 +121,7 @@
                       resource (case object
                                  :tree :wood
                                  :stone :stone)]
-                  (alter world update-in
-                         [:resources resource] + 1)
-                  (alter world update-in
-                         [:players player-id :collected resource] + 1)
+                  (collect-resource player-id resource 1)
                   (alter world update :objects dissoc target)
 
                   {:status :ok
