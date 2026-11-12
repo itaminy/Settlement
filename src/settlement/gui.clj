@@ -4,7 +4,8 @@
             [settlement.rendering :as rendering]
             [settlement.inventory :as inventory]
             [settlement.inventory-ui :as inventory-ui]
-            [settlement.gathering-ui :as gathering-ui])
+            [settlement.gathering-ui :as gathering-ui]
+            [settlement.building-ui :as building-ui])
   (:import [javax.swing JFrame JDialog JPanel JLabel SwingUtilities
             AbstractAction KeyStroke Timer JOptionPane JProgressBar]
            [java.awt Color Dimension BorderLayout FlowLayout Font GraphicsEnvironment]
@@ -36,9 +37,11 @@
                                image))]
                  (.putClientProperty this ::camera camera)
                  (.putClientProperty this ::scene image)
-                 (.drawImage graphics image
-                             (quot (- (.getWidth this) (:width camera)) 2)
-                             (quot (- (.getHeight this) (:height camera)) 2) nil)))))]
+                 (let [ox (quot (- (.getWidth this) (:width camera)) 2)
+                       oy (quot (- (.getHeight this) (:height camera)) 2)]
+                   (.drawImage graphics image ox oy nil)
+                   (when-let [overlay (.getClientProperty this ::overlay)]
+                     (overlay graphics camera ox oy)))))))]
      (.putClientProperty panel ::player-id player-id)
      (.setBackground panel (Color. 40 55 35))
      (.setPreferredSize panel (Dimension. config/viewport-width config/viewport-height))
@@ -176,6 +179,13 @@
         resource-ui (assoc (create-resource-panel (player-resources (:world response) player-id))
                            :inventory-ui inventory-panel :progress-bar progress)
         inventory-window (JDialog. frame "Инвентарь" false)
+        build-label (doto (JLabel. "B — строительство") (.setForeground (Color. 240 230 193))
+                          (.setPreferredSize (Dimension. 600 40)))
+        footer (doto (JPanel. (BorderLayout.)) (.setBackground (Color. 45 59 39)))
+        builder (building-ui/install! map-panel connection player-id build-label
+                  (fn [state] (update-map map-panel (:players state) (:objects state))
+                              (update-player-panels! resource-ui state player-id))
+                  #(cancel-local-gather! map-panel))
         timer (start-map-updater map-panel connection resource-ui player-id)]
     (doseq [[key direction] [[KeyEvent/VK_UP :up] [KeyEvent/VK_DOWN :down]
                              [KeyEvent/VK_LEFT :left] [KeyEvent/VK_RIGHT :right]]]
@@ -205,6 +215,7 @@
       (proxy [WindowAdapter] []
         (windowClosed [_]
           (.stop timer)
+          ((:close! builder))
           (when-let [controller (.getClientProperty map-panel ::gather-controller)]
             ((:release! controller)) (.stop (:timer controller)))
           (.dispose inventory-window)
@@ -212,7 +223,9 @@
     (.setLayout (.getContentPane frame) (BorderLayout.))
     (.add (.getContentPane frame) (:panel resource-ui) BorderLayout/NORTH)
     (.add (.getContentPane frame) map-panel BorderLayout/CENTER)
-    (.add (.getContentPane frame) progress BorderLayout/SOUTH)
+    (.add footer progress BorderLayout/NORTH)
+    (.add footer build-label BorderLayout/SOUTH)
+    (.add (.getContentPane frame) footer BorderLayout/SOUTH)
     (.pack frame)
     (let [bounds (.getMaximumWindowBounds (GraphicsEnvironment/getLocalGraphicsEnvironment))]
       (.setSize frame (min (.getWidth frame) (.width bounds))

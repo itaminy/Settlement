@@ -1,7 +1,8 @@
 (ns settlement.rendering
   (:require [clojure.java.io :as io]
             [settlement.config :as config]
-            [settlement.layout :as layout])
+            [settlement.layout :as layout]
+            [settlement.buildings :as buildings])
   (:import [javax.imageio ImageIO]
            [java.awt Color Font RenderingHints BasicStroke]
            [java.awt.geom Area Path2D$Double Ellipse2D$Double]
@@ -63,10 +64,48 @@
    :mushroom-red [22 22] :mushroom-green [22 22]
    :logs [30 52] :stump [38 24] :bench [62 30]})
 
-(def sprites
+(def ^:private base-sprites
   (into {} (for [[kind filename] (assoc sprite-files :tree-small "pine_tree.png" :tree-tall "pine_tree.png")
                  :let [[width height] (sprite-sizes kind)]]
              [kind (scale-image (load-image (str "resources/images/new/" filename)) width height)])))
+
+(def fence-image
+  (let [image (BufferedImage. tile-size 48 BufferedImage/TYPE_INT_ARGB) g (.createGraphics image)]
+    (try
+      (.setColor g (Color. 78 49 28))
+      (doseq [y [17 32]] (.fillRect g 0 y tile-size 9))
+      (.setColor g (Color. 144 101 55))
+      (doseq [y [18 33]] (.fillRect g 0 y tile-size 6))
+      (doseq [x [6 28 50]]
+        (.setColor g (Color. 78 49 28)) (.fillRect g x 5 10 43)
+        (.setColor g (Color. 170 124 67)) (.fillRect g (+ x 2) 7 6 39)
+        (.setColor g (Color. 207 160 91)) (.fillRect g (+ x 2) 7 2 36))
+      (finally (.dispose g))) image))
+
+(defn- connected-fence-image [mask]
+  (if (zero? mask) fence-image
+    (let [image (BufferedImage. tile-size tile-size BufferedImage/TYPE_INT_ARGB)
+          g (.createGraphics image)]
+      (try
+        (doseq [[bit rectangles] [[1 [[25 0 8 32] [39 0 8 32]]]
+                                  [2 [[32 25 32 8] [32 39 32 8]]]
+                                  [4 [[25 32 8 32] [39 32 8 32]]]
+                                  [8 [[0 25 32 8] [0 39 32 8]]]]
+                :when (pos? (bit-and mask bit)) [x y w h] rectangles]
+          (.setColor g (Color. 78 49 28)) (.fillRect g x y w h)
+          (.setColor g (Color. 170 124 67)) (.fillRect g (+ x 2) (+ y 2) (- w 4) (- h 4)))
+        (.setColor g (Color. 78 49 28)) (.fillRect g 27 16 10 40)
+        (.setColor g (Color. 207 160 91)) (.fillRect g 29 18 6 36)
+        (finally (.dispose g))) image)))
+
+(def fence-images (into {} (for [mask (range 16)] [mask (connected-fence-image mask)])))
+
+(defn fence-connections [objects [x y]]
+  (reduce + (for [[bit dx dy] [[1 0 -1] [2 1 0] [4 0 1] [8 -1 0]]
+                  :let [object (get objects [(+ x dx) (+ y dy)])]
+                  :when (and (buildings/building? object) (= :fence (:kind object)))] bit)))
+
+(def sprites (assoc base-sprites :fence fence-image :built-house (:house base-sprites)))
 
 (def decorations layout/decorations)
 (def road? layout/road?)
@@ -165,10 +204,11 @@
 (def cached-grass-for-cell (memoize grass-for-cell))
 
 (defn visible-grass [objects camera]
-  (for [position (visible-cells camera 0)
-        :when (not (contains? objects position))
+  (let [occupied (buildings/occupied-cells objects)]
+   (for [position (visible-cells camera 0)
+        :when (not (occupied position))
         patch (cached-grass-for-cell position)
-        :when (intersects? camera patch)] patch))
+        :when (intersects? camera patch)] patch)))
 
 (defn- draw-grass! [graphics objects camera]
   (doseq [{:keys [kind x y]} (visible-grass objects camera)]
@@ -191,15 +231,36 @@
      :y (max 0 (min (- world-pixel-height height) (- foot-y height)))
      :width width :height height :foot-y foot-y}))
 
+(defn building-placement
+  ([position entry] (building-placement position entry true))
+  ([position entry clamp?]
+   (let [[x y] position [width height] (get-in buildings/catalog [(:kind entry) :size])
+        kind (if (= :house (:kind entry)) :built-house :fence)
+        image ^BufferedImage (if (= kind :fence) (get fence-images (:connections entry 0)) (sprites kind))
+        image-width (.getWidth image) image-height (.getHeight image)
+        foot-x (* (+ x (/ width 2.0)) tile-size)
+        foot-y (- (* (+ y height) tile-size) 8)]
+    {:position position :kind kind :image image
+     :x (int (if clamp? (max 0 (min (- world-pixel-width image-width) (- foot-x (/ image-width 2))))
+                           (- foot-x (/ image-width 2))))
+     :y (if clamp? (max 0 (min (- world-pixel-height image-height) (- foot-y image-height)))
+                   (- foot-y image-height))
+     :width image-width :height image-height :foot-y foot-y})))
+
 (defn scene-sprites [objects camera]
-  (->> (for [position (visible-cells camera 2)
-             :let [object (get objects position)
-                   kind (if object (sprite-kind position object) (get decorations position))]
-             :when (and kind (not= kind :logs))
-             :let [placement (sprite-placement position kind)]
-             :when (intersects? camera placement)]
-         placement)
-       (sort-by (juxt :foot-y :x :kind))))
+  (let [occupied (buildings/occupied-cells objects)]
+    (->> (for [position (visible-cells camera 2)
+               :let [object (get objects position)
+                     kind (if (buildings/building? object) (:kind object)
+                              (if object (sprite-kind position object)
+                                  (when-not (occupied position) (get decorations position))))]
+               :when (and kind (not= kind :logs))
+               :let [placement (if (buildings/building? object)
+                                 (building-placement position (if (= :fence (:kind object))
+                                                               (assoc object :connections (fence-connections objects position)) object))
+                                 (sprite-placement position kind))]
+               :when (intersects? camera placement)] placement)
+         (sort-by (juxt :foot-y :x :kind)))))
 
 (def player-colors [(Color. 52 151 234) (Color. 242 155 45)
                     (Color. 171 100 220) (Color. 224 91 111)])

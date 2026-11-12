@@ -1,7 +1,8 @@
 (ns settlement.world
   (:require [settlement.config :as config]
             [settlement.layout :as layout]
-            [settlement.inventory :as inventory]))
+            [settlement.inventory :as inventory]
+            [settlement.buildings :as buildings]))
 
 (def initial-objects layout/initial-objects)
 
@@ -30,14 +31,15 @@
 
 (defn free-cell? [state position]
   (and (config/in-bounds? position)
-       (not (contains? (:objects state) position))
+       (not (buildings/occupied? (:objects state) position))
        (not (player-at? state position))))
 
 ;; Поиск и создание выполняются в одной транзакции, включая внешнюю auth-транзакцию.
 (defn add-player [player-id name]
   (dosync
     (when-not (contains? (:players @world) player-id)
-      (when-let [[x y] (first (filter #(free-cell? @world %) (layout/spawn-cells)))]
+      (when-let [[x y] (let [accessible (buildings/spawn-accessible-cells (:objects @world))]
+                        (first (filter #(and (accessible %) (free-cell? @world %)) (layout/spawn-cells))))]
         (alter world assoc-in [:players player-id]
                {:name name :x x :y y :inventory inventory/empty-inventory})
         true))))
@@ -81,6 +83,22 @@
     (dosync (change-player-items! id (assoc (into {} (map (fn [[item n]] [item (- n)]) cost)) tool 1)))
     {:status :error :code :unknown-recipe}))
 
+(defn check-build [player-id kind position]
+  (select-keys (buildings/validate @world player-id kind position) [:status :code :cells :cost]))
+
+(defn build! [player-id kind position]
+  (dosync
+    (let [result (buildings/validate @world player-id kind position)]
+      (if-not (= :ok (:status result))
+        (select-keys result [:status :code])
+        (let [payment (change-player-items! player-id
+                        (into {} (map (fn [[item amount]] [item (- amount)]) (:cost result))))]
+          (if-not (= :ok (:status payment)) payment
+            (do
+              (alter world assoc-in [:objects position] (:entry result))
+              (alter gathering dissoc player-id)
+              {:status :ok :position position :building (:entry result)})))))))
+
 (defn move-player-result [player-id direction]
   (dosync
     (let [state @world
@@ -97,7 +115,7 @@
           (cond
             (not (config/in-bounds? position))
             (fail :out-of-bounds "Destination is outside the map")
-            (contains? (:objects state) position)
+            (buildings/occupied? (:objects state) position)
             (fail :object-blocked "Destination is occupied by an object")
             (player-at? state position)
             (fail :player-blocked "Destination is occupied by another player")
@@ -194,7 +212,7 @@
 (defn restore-resource [position object]
   (dosync
     (cond
-      (contains? (:objects @world) position) :exists
+      (buildings/occupied? (:objects @world) position) :exists
       (player-at? @world position) :occupied
       :else (do (alter world assoc-in [:objects position] object) :restored))))
 
