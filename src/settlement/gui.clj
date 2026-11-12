@@ -1,144 +1,35 @@
-
 (ns settlement.gui
-  (:require [settlement.world :as world]
-            [settlement.client :as client])
-  (:import [javax.swing JFrame JPanel JLabel SwingConstants SwingUtilities
-          AbstractAction KeyStroke Timer ImageIcon JOptionPane]
-         [javax.swing.border LineBorder]
-         [java.awt Color Dimension GridLayout BorderLayout FlowLayout Font]
-         [java.awt.image BufferedImage]
-         [java.awt.event ActionEvent ActionListener KeyEvent WindowAdapter]))
+  (:require [settlement.client :as client]
+            [settlement.rendering :as rendering])
+  (:import [javax.swing JFrame JPanel JLabel SwingUtilities
+            AbstractAction KeyStroke Timer JOptionPane]
+           [java.awt Color Dimension BorderLayout FlowLayout Font RenderingHints GraphicsEnvironment]
+           [java.awt.event ActionListener KeyEvent WindowAdapter]))
 
-;; Размер карты
-(def map-size 12)
-;; Загрузка изображений игровых объектов
-;; Загрузка и масштабирование изображений
-(defn load-icon [path width height]
-  (let [image (.getImage (ImageIcon. path))
-        scaled (.getScaledInstance
-                image
-                width
-                height
-                java.awt.Image/SCALE_REPLICATE)]
-    (ImageIcon. scaled)))
-
-(def tree-icon
-  (load-icon "resources/images/tree.png" 44 44))
-
-(def stone-icon
-  (load-icon "resources/images/stone.png" 44 44))
-
-(def house-icon
-  (load-icon "resources/images/house.png" 44 44))
-
-;; Текстуры поверхности карты
-(def grass-icon
-  (load-icon "resources/images/grass.png" 44 44))
-
-(def dirt-icon
-  (load-icon "resources/images/dirt.png" 44 44))
-
-
-;; Объединение текстуры поверхности и игрового объекта
-(defn create-tile-icon [background-icon object-icon]
-  (let [image (BufferedImage.
-               44 44
-               BufferedImage/TYPE_INT_ARGB)
-        graphics (.createGraphics image)]
-
-    ;; Сначала рисуем траву или землю
-    (.drawImage graphics
-                (.getImage background-icon)
-                0 0 nil)
-
-    ;; Затем рисуем объект поверх поверхности
-    (when object-icon
-      (.drawImage graphics
-                  (.getImage object-icon)
-                  0 0 nil))
-
-    (.dispose graphics)
-
-    (ImageIcon. image)))
+(def map-size rendering/map-size)
 
 (defn update-map [panel players objects]
-  (let [cells (.getComponents panel)]
-    (doseq [i (range (count cells))]
-      (let [cell (aget cells i)
-            x (mod i map-size)
-            y (quot i map-size)
-            player (first
-                    (filter
-                     (fn [[id p]]
-                       (and (= x (:x p))
-                            (= y (:y p))))
-                     players))
-            object (get objects [x y])]
+  (.putClientProperty panel ::scene (rendering/render-scene players objects))
+  (.repaint panel))
 
-        (.setBackground cell
-          (if player
-            (Color. 100 170 100)
-            (Color. 225 235 215)))
-
-
-;; Выбираем поверхность и объект
-(let [background-icon
-      (if (or (= y 6)
-              (and (= x 4) (<= 3 y 8)))
-        dirt-icon
-        grass-icon)
-
-      object-icon
-      (case object
-        :tree tree-icon
-        :stone stone-icon
-        :house house-icon
-        nil)]
-
-  ;; Рисуем поверхность и объект вместе
-  (.setIcon cell
-    (create-tile-icon
-      background-icon
-      (when-not player object-icon))))
-
-
-;; Отображаем номер игрока
-(.setText cell
-  (if player
-    (str (first player))
-    ""))))))
-
-;; Создание игрового поля
-(defn create-map-panel [player-x player-y]
-  (let [panel (JPanel. (GridLayout. map-size map-size))]
-
-    (dotimes [i (* map-size map-size)]
-      (let [cell (JLabel. "" SwingConstants/CENTER)]
-
-        (.setOpaque cell true)
-        (.setHorizontalAlignment cell SwingConstants/CENTER)
-        (.setVerticalAlignment cell SwingConstants/CENTER)
-        (.setHorizontalTextPosition cell SwingConstants/CENTER)
-        (.setVerticalTextPosition cell SwingConstants/CENTER)
-
-        (let [x (mod i map-size)
-            y (quot i map-size)]
-            (if (and (= x player-x)
-                (= y player-y))
-        (.setBackground cell (Color. 100 170 100))
-        (.setBackground cell (Color. 225 235 215))))
-
-        (.setBorder cell (LineBorder. (Color. 170 180 160)))
-        (.setPreferredSize cell (Dimension. 45 45))
-
-        (let [x (mod i map-size)
-            y (quot i map-size)]
-        (when (and (= x player-x)
-             (= y player-y))
-          (.setText cell "P")))
-
-        (.add panel cell)))
-
+(defn create-map-panel [_player-x _player-y]
+  (let [panel
+        (proxy [JPanel] []
+          (paintComponent [graphics]
+            (proxy-super paintComponent graphics)
+            (when-let [image (.getClientProperty this ::scene)]
+              (let [size (min (.getWidth this) (.getHeight this))
+                    x (quot (- (.getWidth this) size) 2)
+                    y (quot (- (.getHeight this) size) 2)
+                    drawing (.create graphics)]
+                (try
+                  (.setRenderingHint drawing RenderingHints/KEY_INTERPOLATION
+                                     RenderingHints/VALUE_INTERPOLATION_NEAREST_NEIGHBOR)
+                  (.drawImage drawing image x y size size nil)
+                  (finally (.dispose drawing)))))))]
+    (.setBackground panel (Color. 40 55 35))
+    (.setPreferredSize panel (Dimension. rendering/canvas-size rendering/canvas-size))
+    (update-map panel {} {})
     panel))
 
 (defn bind-key [panel connection player-id key-code direction]
@@ -203,6 +94,7 @@
                          {:type :state})]
 
                     (when (= :ok (:status state))
+                      (update-map panel (get-in state [:world :players]) (get-in state [:world :objects]))
                       (update-resource-panel
                        resource-ui
                        (player-resources (:world state) player-id)))))))))))
@@ -303,6 +195,9 @@
     (.add (.getContentPane frame) (:panel resource-ui) BorderLayout/NORTH)
     (.add (.getContentPane frame) map-panel BorderLayout/CENTER)
     (.pack frame)
+    (let [bounds (.getMaximumWindowBounds (GraphicsEnvironment/getLocalGraphicsEnvironment))]
+      (.setSize frame (min (.getWidth frame) (.width bounds))
+                      (min (.getHeight frame) (.height bounds))))
     (.setLocationRelativeTo frame nil)
     (.setVisible frame true)
     (.requestFocusInWindow map-panel)))

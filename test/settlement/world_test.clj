@@ -3,6 +3,7 @@
             [settlement.server :as server]
             [settlement.auth :as auth]
             [settlement.auth-test]
+            [settlement.rendering-test]
             [settlement.gui :as gui]
             [settlement.world :as world]))
 
@@ -248,7 +249,7 @@
     (when-not (#{"fast" "slow" "all"} suite)
       (throw (ex-info "Expected fast, slow or all" {:suite suite})))
     (try
-      (let [tests (->> ["settlement.world-test" "settlement.auth-test"]
+      (let [tests (->> ["settlement.world-test" "settlement.auth-test" "settlement.rendering-test"]
                        (mapcat #(vals (ns-interns (symbol %))))
                        (filter #(-> % meta :test))
                        (filter #(case suite
