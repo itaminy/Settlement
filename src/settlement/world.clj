@@ -7,7 +7,13 @@
     {:wood 0
      :stone 0}
 
-    :players {}}))
+    :players {}
+
+    :objects
+    {[3 4] :tree
+     [7 2] :stone
+     [8 6] :house
+     [5 5] :tree}}))
 
 ;; Регистрация игрока
 (defn add-player [player-id name]
@@ -56,3 +62,67 @@
           (alter world assoc-in
                  [:players player-id :y] new-y)
           true)))))
+
+
+(declare schedule-resource-restore)
+;; Добыча ресурса с удалением объекта
+
+(defn gather-resource [player-id]
+  (let [result
+        (dosync
+          (if-let [player (get-in @world [:players player-id])]
+            (let [{:keys [x y]} player
+                  neighbors [[(inc x) y]
+                             [(dec x) y]
+                             [x (inc y)]
+                             [x (dec y)]]
+                  objects (:objects @world)
+                  target (some
+                          (fn [pos]
+                            (when (#{:tree :stone} (get objects pos))
+                              pos))
+                          neighbors)]
+              (if target
+                (let [object (get objects target)
+                      resource (case object
+                                 :tree :wood
+                                 :stone :stone)]
+                  (alter world update-in
+                         [:resources resource] + 1)
+                  (alter world update-in
+                         [:players player-id :collected resource] + 1)
+                  (alter world update :objects dissoc target)
+
+                  {:status :ok
+                   :resource resource
+                   :amount 1
+                   :position target
+                   :object object})
+
+                {:status :error
+                 :message "No resource nearby"}))
+
+            {:status :error
+             :message "Player not found"}))]
+
+    ;; Планируем восстановление после завершения транзакции
+    (when (= :ok (:status result))
+      (schedule-resource-restore
+       (:position result)
+       (:object result)))
+
+    (dissoc result :object)))
+
+
+
+;; Восстановление добытого объекта
+(defn restore-resource [position object]
+  (dosync
+    (when-not (get-in @world [:objects position])
+      (alter world assoc-in [:objects position] object))))
+
+;; Планирование восстановления через 30 секунд
+(defn schedule-resource-restore [position object]
+  (future
+    (Thread/sleep 30000)
+    (restore-resource position object)))

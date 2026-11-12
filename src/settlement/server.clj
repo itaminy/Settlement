@@ -10,7 +10,9 @@
 (defn process-message [message]
   (let [{:keys [type player-id name resource amount]} message]
     (case type
-
+      :gather
+      (world/gather-resource (:player-id message))
+      
       :register
       (do
         (world/add-player player-id name)

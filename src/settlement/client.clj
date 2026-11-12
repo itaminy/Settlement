@@ -11,6 +11,20 @@
   (.flush writer)
   (protocol/read-message (.readLine reader)))
 
+(defn connect []
+  (let [socket (Socket. "127.0.0.1" 5000)
+        reader (BufferedReader.
+                (InputStreamReader. (.getInputStream socket)))
+        writer (BufferedWriter.
+                (OutputStreamWriter. (.getOutputStream socket)))]
+
+    {:socket socket
+     :reader reader
+     :writer writer}))
+
+(defn close-connection [connection]
+  (.close (:socket connection)))
+  
 (defn -main []
   (with-open [socket (Socket. "127.0.0.1" 5000)
               reader (BufferedReader.
@@ -44,7 +58,7 @@
                        {:type :move
                         :player-id 1
                         :direction :up}))
-                        
+
         ;; Перемещение игрока
     (println "Moving right:")
     (prn (send-message writer
