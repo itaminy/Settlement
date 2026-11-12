@@ -1,0 +1,230 @@
+(ns settlement.auth-test
+  (:require [clojure.test :refer :all]
+            [clojure.java.io :as io]
+            [settlement.auth :as auth]
+            [settlement.world :as world]
+            [settlement.server :as server]
+            [settlement.client :as client]
+            [settlement.gui :as gui]
+            [settlement.credentials :as credentials])
+  (:import [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]
+           [java.net ServerSocket Socket]))
+
+(use-fixtures :each
+  (fn [f]
+    (let [directory (.toFile (Files/createTempDirectory "settlement-test-" (make-array FileAttribute 0)))]
+      (try
+        (binding [credentials/*credentials-file* (str (io/file directory "credentials.edn"))]
+          (with-redefs [world/world (ref {:players {} :resources {:wood 0 :stone 0}
+                                         :objects {[1 0] :tree [3 0] :stone}})
+                        auth/state (ref (auth/new-state))
+                        world/schedule-resource-restore (fn [_ _] nil)]
+            (f)))
+        (finally
+          (doseq [file (reverse (file-seq directory))] (io/delete-file file true)))))))
+
+(defn- register [connection id]
+  (server/process-message connection {:type :register :player-id id :name (str "Player " id)}))
+
+(defn- login [connection id registration]
+  (server/process-message connection (assoc (select-keys registration [:token :server-instance])
+                                           :type :login :player-id id)))
+
+(deftest registration-and-secrets-test
+  (let [first (register :a 1)
+        second (register :b 2)
+        before (world/get-world)]
+    (is (= :ok (:status first)))
+    (is (= 43 (count (:token first))))
+    (is (not= (:token first) (:token second)))
+    (is (= :error (:status (register :c 1))))
+    (is (= :error (:status (register :a 1))))
+    (is (= :error (:status (register :a 3))))
+    (is (= before (world/get-world)))
+    (is (not (.contains (pr-str (server/process-message {:type :state})) (:token first))))
+    (is (not (.contains (pr-str @auth/state) (:token first))))
+    (is (nil? (world/add-player 1 "Replacement")))
+    (is (= before (world/get-world)))))
+
+(deftest command-authorization-test
+  (register :a 1)
+  (register :b 2)
+  (doseq [connection [nil :unregistered :b]
+          command [{:type :move :direction :right} {:type :gather}]]
+    (let [before (world/get-world)]
+      (is (= :error (:status (server/process-message connection (assoc command :player-id 1)))))
+      (is (= before (world/get-world)))))
+  (is (= :error (:status (server/process-message :a {:type :move :direction :right}))))
+  (is (= :ok (:status (server/process-message :a {:type :gather :player-id 1}))))
+  (is (= :ok (:status (server/process-message :a {:type :move :player-id 1 :direction :down}))))
+  (is (= :ok (:status (server/process-message :b {:type :move :player-id 2 :direction :down})))))
+
+(deftest reconnect-preserves-progress-test
+  (let [registration (register :a 1)]
+    (server/process-message :a {:type :gather :player-id 1})
+    (server/process-message :a {:type :move :player-id 1 :direction :down})
+    (let [before (world/get-world)]
+      (is (= :already-connected (:code (login :b 1 registration))))
+      (auth/disconnect! :a)
+      (is (= :error (:status (register :b 1))))
+      (is (= :invalid-credentials (:code (login :b 1 (assoc registration :token "wrong")))))
+      (is (= :invalid-credentials (:code (login :b 2 registration))))
+      (is (= :ok (:status (login :b 1 registration))))
+      (auth/disconnect! :a)
+      (is (= 1 (auth/owner :b)))
+      (is (= before (world/get-world)))
+      (is (= {:wood 1 :stone 0} (get-in before [:players 1 :collected])))
+      (is (= 1 (get-in before [:players 1 :y]))))))
+
+(deftest concurrent-registration-and-login-test
+  (let [start (promise)
+        tasks (mapv #(future @start (register % 1)) [:a :b])]
+    (deliver start true)
+    (let [results (mapv #(deref % 5000 {:status :timeout}) tasks)
+          registration (first (filter #(= :ok (:status %)) results))]
+      (is (= {:ok 1 :error 1} (frequencies (map :status results))))
+      (auth/disconnect! :a)
+      (auth/disconnect! :b)
+      (let [start (promise)
+            tasks (mapv #(future @start (login % 1 registration)) [:c :d])]
+        (deliver start true)
+        (is (= {:ok 1 :error 1}
+               (frequencies (map :status (mapv #(deref % 5000 {:status :timeout}) tasks)))))))))
+
+(deftest credentials-storage-test
+  (is (nil? (credentials/load-entry "server" 1)))
+  (let [tasks (mapv (fn [id] (future (credentials/save-entry! "server" id "old" (str "secret-" id)))) [1 2])]
+    (is (every? #(= :ok (:status (deref % 5000 {}))) tasks)))
+  (is (= "secret-1" (:token (credentials/load-entry "server" 1))))
+  (is (= "secret-2" (:token (credentials/load-entry "server" 2))))
+  (credentials/save-entry! "server" 1 "new" "replacement")
+  (is (= "old" (:server-instance (credentials/load-entry "server" 2))))
+  (is (= "new" (:server-instance (credentials/load-entry "server" 1))))
+  (spit credentials/*credentials-file* "{broken")
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Cannot read local credentials"
+                        (credentials/load-entry "server" 1)))
+  (is (= {:status :error :code :credentials-save-failed}
+         (credentials/save-entry! "server" 1 "new" "never-log-this"))))
+
+(deftest client-save-retry-and-reconnect-test
+  (let [connection (atom :a)
+        save credentials/save-entry!
+        attempts (atom 0)
+        retries (atom 0)]
+    (with-redefs [client/request (fn [_ message] (server/process-message @connection message))
+                  credentials/save-entry! (fn [& args]
+                                            (if (= 1 (swap! attempts inc))
+                                              {:status :error :code :credentials-save-failed}
+                                              (apply save args)))]
+      (is (= {:status :ok}
+             (client/authorize! {} 1 "Alice" (constantly false)
+                                #(do (swap! retries inc) true))))
+      (is (= 1 @retries))
+      (is (= 2 @attempts))
+      (server/process-message :a {:type :gather :player-id 1})
+      (server/process-message :a {:type :move :player-id 1 :direction :down})
+      (auth/disconnect! :a)
+      (reset! connection :b)
+      (let [before (world/get-world)]
+        (is (= :ok (:status (client/authorize! {} 1 "Changed" (constantly false) (constantly false)))))
+        (is (= before (world/get-world)))))))
+
+(deftest stale-token-client-test
+  (credentials/save-entry! "127.0.0.1:5000" 1 "previous-server" "old-secret")
+  (with-redefs [client/request (fn [_ message] (server/process-message :a message))]
+    (is (= :cancelled (:code (client/authorize! {} 1 "Alice" (constantly false) (constantly false)))))
+    (is (empty? (:players (world/get-world))))
+    (is (= :ok (:status (client/authorize! {} 1 "Alice" (constantly true) (constantly false)))))
+    (is (not= "old-secret" (:token (credentials/load-entry "127.0.0.1:5000" 1))))))
+
+(deftest stale-token-cannot-replace-existing-player-test
+  (let [registration (register :existing 1)
+        before (world/get-world)]
+    (credentials/save-entry! "127.0.0.1:5000" 1 "previous-server" "old-secret")
+    (with-redefs [client/request (fn [_ message] (server/process-message :new message))]
+      (is (= :player-exists (:code (client/authorize! {} 1 "Replacement" (constantly true) (constantly false))))))
+    (is (= before (world/get-world)))
+    (is (= "old-secret" (:token (credentials/load-entry "127.0.0.1:5000" 1))))
+    (is (= :stale-server (:code (login :new 1 (assoc registration :server-instance "old")))))))
+
+(deftest save-cancel-does-not-expose-secret-test
+  (with-redefs [client/request (fn [_ message] (server/process-message :a message))
+                credentials/save-entry! (fn [& _] {:status :error :code :credentials-save-failed})]
+    (let [result (atom nil)
+          output (with-out-str (reset! result (client/authorize! {} 1 "Alice" (constantly false) (constantly false))))]
+      (is (= "" output))
+      (is (= {:status :error :code :credentials-save-failed} @result)))))
+
+(deftest gui-key-bindings-test
+  (register :a 1)
+  (let [panel (gui/create-map-panel 0 0)
+        resource-ui (gui/create-resource-panel (:resources (world/get-world)))]
+    (with-redefs [client/send-message (fn [_ _ message] (server/process-message :a message))]
+      (gui/bind-gather-key panel {} resource-ui 1)
+      (gui/bind-key panel {} 1 java.awt.event.KeyEvent/VK_RIGHT :right)
+      (.actionPerformed (.get (.getActionMap panel) "gather") nil)
+      (is (= {:wood 1 :stone 0} (get-in (world/get-world) [:players 1 :collected])))
+      (is (nil? (get-in (world/get-world) [:objects [1 0]])))
+      (.actionPerformed (.get (.getActionMap panel) "move-right") nil)
+      (is (= 1 (get-in (world/get-world) [:players 1 :x]))))))
+
+(deftest two-tcp-clients-and-reconnect-test
+  (with-open [listener (ServerSocket. 0)]
+    (let [connections (atom [])
+          open! (fn []
+                  (let [socket (Socket. "127.0.0.1" (.getLocalPort listener))
+                        accepted (.accept listener)
+                        handler (future (server/handle-client accepted))
+                        connection {:socket socket
+                                    :reader (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream socket) "UTF-8"))
+                                    :writer (java.io.BufferedWriter. (java.io.OutputStreamWriter. (.getOutputStream socket) "UTF-8"))}]
+                    (.setSoTimeout socket 5000)
+                    (swap! connections conj [connection handler])
+                    connection))]
+      (try
+        (let [a (open!) b (open!)
+              authorize (fn [connection id] (client/authorize! connection id (str "Player " id)
+                                                               (constantly false) (constantly false)))]
+          (is (= :ok (:status (authorize a 1))))
+          (is (= :ok (:status (authorize b 2))))
+          (is (= :ok (:status (client/request a {:type :gather :player-id 1}))))
+          (client/request a {:type :move :player-id 1 :direction :down})
+          (let [before (world/get-world)
+                duplicate (open!)]
+            (is (= :already-connected (:code (authorize duplicate 1))))
+            (is (= :wrong-player (:code (client/request b {:type :move :player-id 1 :direction :right}))))
+            (is (= :wrong-player (:code (client/request b {:type :gather :player-id 1}))))
+            (client/close-connection a)
+            (is (not= ::timeout (deref (second (first @connections)) 5000 ::timeout)))
+            (is (= :ok (:status (authorize (open!) 1))))
+            (is (= before (world/get-world)))
+            (is (= 1 (get-in before [:players 1 :y])))
+            (is (= 1 (get-in before [:players 1 :collected :wood])))
+            (is (= :ok (:status (client/request b {:type :move :player-id 2 :direction :down}))))))
+        (finally
+          (doseq [[connection handler] @connections]
+            (client/close-connection connection)
+            (deref handler 5000 nil)
+            (future-cancel handler)))))))
+
+(deftest tcp-disconnect-test
+  (with-open [listener (ServerSocket. 0)
+              socket (Socket. "127.0.0.1" (.getLocalPort listener))]
+    (let [handler (future (server/handle-client (.accept listener)))
+          connection {:socket socket
+                      :reader (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream socket) "UTF-8"))
+                      :writer (java.io.BufferedWriter. (java.io.OutputStreamWriter. (.getOutputStream socket) "UTF-8"))}]
+      (.setSoTimeout socket 5000)
+      (try
+        (let [registration (client/request connection {:type :register :player-id 1 :name "Alice"})]
+          (is (= :ok (:status registration)))
+          (is (= :ok (:status (client/request connection {:type :gather :player-id 1}))))
+          (client/request connection {:type :move :player-id 1 :direction :down})
+          (let [before (world/get-world)]
+            (.close socket)
+            (is (not= ::timeout (deref handler 5000 ::timeout)))
+            (is (empty? (:sessions @auth/state)))
+            (is (= :ok (:status (login :reconnected 1 registration))))
+            (is (= before (world/get-world)))))
+        (finally (.close socket) (future-cancel handler))))))

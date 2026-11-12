@@ -3,11 +3,11 @@
   (:require [settlement.world :as world]
             [settlement.client :as client])
   (:import [javax.swing JFrame JPanel JLabel SwingConstants SwingUtilities
-          AbstractAction KeyStroke Timer ImageIcon]
+          AbstractAction KeyStroke Timer ImageIcon JOptionPane]
          [javax.swing.border LineBorder]
          [java.awt Color Dimension GridLayout BorderLayout FlowLayout Font]
          [java.awt.image BufferedImage]
-         [java.awt.event ActionEvent ActionListener KeyEvent]))
+         [java.awt.event ActionEvent ActionListener KeyEvent WindowAdapter]))
 
 ;; Размер карты
 (def map-size 12)
@@ -236,7 +236,8 @@
 
                    ;; Обновляем панель ресурсов
                    (update-resource-panel resource-ui resources)))))))]
-    (.start timer)))
+    (.start timer)
+    timer))
 
 
 
@@ -269,52 +270,66 @@
             (str "Камень: " (:stone resources 0))))
 
 ;; Создание игрового окна
+(defn- confirm-dialog [message]
+  (= JOptionPane/YES_OPTION
+     (JOptionPane/showConfirmDialog nil message "Settlement" JOptionPane/YES_NO_OPTION)))
+
+(defn- authorization-message [code]
+  (case code
+    :already-connected "Этот персонаж уже подключён в другом окне."
+    :player-exists "Персонаж с этим ID уже существует. Для входа нужен его сохранённый токен."
+    :invalid-credentials "Данные входа не подходят. Персонаж не изменён."
+    :credentials-save-failed "Данные входа не сохранены. Подключение закрыто."
+    :credentials-unavailable "Не удалось прочитать данные входа или связаться с сервером."
+    :cancelled "Создание нового персонажа отменено."
+    :stale-server "Сервер был перезапущен. Повторите подключение."
+    :invalid-registration "Нужны положительный числовой ID и непустое имя."
+    "Не удалось выполнить вход."))
+
+(defn- open-game-window [connection player-id]
+  (let [frame (JFrame. "Settlement")
+        response (client/request connection {:type :state})
+        player (get-in response [:world :players player-id])
+        map-panel (create-map-panel (:x player) (:y player))
+        resource-ui (create-resource-panel (get-in response [:world :resources]))
+        timer (start-map-updater map-panel connection resource-ui)]
+    (doseq [[key direction] [[KeyEvent/VK_UP :up] [KeyEvent/VK_DOWN :down]
+                             [KeyEvent/VK_LEFT :left] [KeyEvent/VK_RIGHT :right]]]
+      (bind-key map-panel connection player-id key direction))
+    (bind-gather-key map-panel connection resource-ui player-id)
+    (update-map map-panel (get-in response [:world :players]) (get-in response [:world :objects]))
+    (.setDefaultCloseOperation frame JFrame/DISPOSE_ON_CLOSE)
+    (.addWindowListener frame
+      (proxy [WindowAdapter] []
+        (windowClosed [_]
+          (.stop timer)
+          (client/close-connection connection))))
+    (.setLayout (.getContentPane frame) (BorderLayout.))
+    (.add (.getContentPane frame) (:panel resource-ui) BorderLayout/NORTH)
+    (.add (.getContentPane frame) map-panel BorderLayout/CENTER)
+    (.pack frame)
+    (.setLocationRelativeTo frame nil)
+    (.setVisible frame true)
+    (.requestFocusInWindow map-panel)))
+
 (defn show-window [player-id player-name]
   (SwingUtilities/invokeLater
    (fn []
-     (let [frame (JFrame. "Settlement")
-           connection (client/connect)
-
-           registration
-           (client/send-message
-            (:writer connection)
-            (:reader connection)
-            {:type :register
-             :player-id player-id
-             :name player-name})
-
-           response
-           (client/send-message
-            (:writer connection)
-            (:reader connection)
-            {:type :state})
-
-            player (get-in (:world response) [:players player-id])
-            map-panel (create-map-panel (:x player) (:y player))
-
-            resource-ui (create-resource-panel
-            (get-in response [:world :resources]))]
-            (bind-key map-panel connection player-id KeyEvent/VK_UP :up)
-            (bind-key map-panel connection player-id KeyEvent/VK_DOWN :down)
-            (bind-key map-panel connection player-id KeyEvent/VK_LEFT :left)
-            (bind-key map-panel connection player-id KeyEvent/VK_RIGHT :right)
-            (start-map-updater map-panel connection resource-ui)
-            (bind-gather-key map-panel connection resource-ui player-id)
-
-       (.setDefaultCloseOperation frame JFrame/EXIT_ON_CLOSE)
-       (.setLayout (.getContentPane frame)
-            (BorderLayout.))
-
-        (.add (.getContentPane frame)
-          (:panel resource-ui)
-          BorderLayout/NORTH)
-
-        (.add (.getContentPane frame)
-          map-panel
-          BorderLayout/CENTER)
-       (.setFocusable map-panel true)
-       
-       (.pack frame)
-       (.setLocationRelativeTo frame nil)
-       (.setVisible frame true)
-       (.requestFocusInWindow map-panel)))))
+     (try
+       (let [connection (client/connect)]
+         (try
+           (let [result (client/authorize!
+                         connection player-id player-name
+                         #(confirm-dialog "Сервер перезапущен. Прежний прогресс утрачен. Создать нового персонажа?")
+                         #(confirm-dialog "Не удалось сохранить данные входа. Повторить сохранение? При отказе доступ к новому персонажу может быть потерян."))]
+             (if (= :ok (:status result))
+               (open-game-window connection player-id)
+               (do
+                 (client/close-connection connection)
+                 (JOptionPane/showMessageDialog nil
+                   (authorization-message (:code result)) "Settlement" JOptionPane/ERROR_MESSAGE))))
+           (catch Exception _
+             (client/close-connection connection)
+             (JOptionPane/showMessageDialog nil "Не удалось открыть игру."))))
+       (catch Exception _
+         (JOptionPane/showMessageDialog nil "Нет соединения с сервером."))))))

@@ -1,6 +1,8 @@
 (ns settlement.world-test
   (:require [clojure.test :refer :all]
             [settlement.server :as server]
+            [settlement.auth :as auth]
+            [settlement.auth-test]
             [settlement.world :as world]))
 
 ;; Запуск: clojure -M -m settlement.world-test fast (или slow, all).
@@ -15,6 +17,7 @@
   (fn [test-fn]
     ;; Исходный ref не меняется. Быстрые тесты не оставляют фоновых задач.
     (with-redefs [world/world (ref initial-world)
+                  auth/state (ref (auth/new-state))
                   world/schedule-resource-restore (fn [_ _] nil)]
       (test-fn))))
 
@@ -86,13 +89,14 @@
   (doseq [[id x y position resource object]
           [[1 2 4 [3 4] :wood :tree] [2 6 2 [7 2] :stone :stone]]]
     (place-player! id x y)
+    (dosync (alter auth/state assoc-in [:sessions id] id))
     (let [before (world/get-world)
           scheduled (atom [])]
       (with-redefs [world/schedule-resource-restore
                     (fn [pos obj] (swap! scheduled conj [pos obj]))]
         ;; Количество и тип добычи определяет сервер, даже с лишними полями.
         (is (= {:status :ok :resource resource :amount 1 :position position}
-               (server/process-message
+               (server/process-message id
                 {:type :gather :player-id id :resource :gold :amount 1000000000})))
         (is (= (update (:resources before) resource inc)
                (:resources (world/get-world))))
@@ -102,7 +106,7 @@
         (is (= (dissoc (:objects before) position) (:objects (world/get-world))))
         (is (= [[position object]] @scheduled))
         (let [after (world/get-world)]
-          (is (= :error (:status (server/process-message {:type :gather :player-id id}))))
+          (is (= :error (:status (server/process-message id {:type :gather :player-id id}))))
           (is (= after (world/get-world)))
           (is (= 1 (count @scheduled)))))))
   (place-player! 3 0 0)
@@ -210,8 +214,8 @@
     (when-not (#{"fast" "slow" "all"} suite)
       (throw (ex-info "Expected fast, slow or all" {:suite suite})))
     (try
-      (let [tests (->> (ns-interns 'settlement.world-test)
-                       vals
+      (let [tests (->> ["settlement.world-test" "settlement.auth-test"]
+                       (mapcat #(vals (ns-interns (symbol %))))
                        (filter #(-> % meta :test))
                        (filter #(case suite
                                   "fast" (not (:slow (meta %)))

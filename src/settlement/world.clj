@@ -18,13 +18,15 @@
 ;; Регистрация игрока
 (defn add-player [player-id name]
   (dosync
-    (alter world assoc-in
+    (when-not (contains? (:players @world) player-id)
+      (alter world assoc-in
            [:players player-id]
            {:name name
             :x 0
             :y 0
             :collected {:wood 0
-                        :stone 0}})))
+                        :stone 0}})
+      true)))
 
 ;; Добыча ресурсов
 (defn collect-resource [player-id resource amount]
