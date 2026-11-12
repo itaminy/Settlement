@@ -1,5 +1,17 @@
 (ns settlement.world)
 
+;; Постоянная начальная раскладка: 18 деревьев, 12 камней и 3 дома.
+(def initial-objects
+  {[3 4] :tree  [5 5] :tree  [2 1] :tree  [5 1] :tree
+   [9 1] :tree  [1 3] :tree  [5 3] :tree  [9 3] :tree
+   [7 4] :tree  [10 5] :tree [1 7] :tree  [3 7] :tree
+   [7 7] :tree  [10 7] :tree [2 9] :tree  [5 9] :tree
+   [9 9] :tree  [7 10] :tree
+   [7 2] :stone [1 1] :stone [10 2] :stone [3 2] :stone
+   [2 5] :stone [8 5] :stone [5 7] :stone  [11 8] :stone
+   [1 10] :stone [4 10] :stone [9 11] :stone [11 10] :stone
+   [8 6] :house [6 8] :house [3 10] :house})
+
 ;; Общее состояние игрового мира
 (def world
   (ref
@@ -9,11 +21,7 @@
 
     :players {}
 
-    :objects
-    {[3 4] :tree
-     [7 2] :stone
-     [8 6] :house
-     [5 5] :tree}}))
+    :objects initial-objects}))
 
 ;; Регистрация игрока
 (defn add-player [player-id name]
@@ -24,6 +32,7 @@
            {:name name
             :x 0
             :y 0
+            ;; Личный запас; :resources мира используется только для статистики.
             :collected {:wood 0
                         :stone 0}})
       true)))

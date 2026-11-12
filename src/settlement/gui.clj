@@ -171,6 +171,9 @@
 ;; Объявляем функцию обновления ресурсов
 (declare update-resource-panel)
 
+(defn player-resources [state player-id]
+  (get-in state [:players player-id :collected] {:wood 0 :stone 0}))
+
 ;; Добыча ресурсов по клавише E
 (defn bind-gather-key [panel connection resource-ui player-id]
   (let [input-map (.getInputMap panel
@@ -202,19 +205,10 @@
                     (when (= :ok (:status state))
                       (update-resource-panel
                        resource-ui
-                       (get-in state [:world :resources])))))))))))
+                       (player-resources (:world state) player-id)))))))))))
 
 
-;; Обновление количества ресурсов
-(defn update-resource-panel [resource-ui resources]
-  (.setText (:wood-label resource-ui)
-            (str "Дерево: " (:wood resources 0)))
-
-  (.setText (:stone-label resource-ui)
-            (str "Камень: " (:stone resources 0))))
-
-
-(defn start-map-updater [panel connection resource-ui]
+(defn start-map-updater [panel connection resource-ui player-id]
   (let [timer
         (Timer.
          1000
@@ -229,7 +223,7 @@
                (when (= :ok (:status response))
                  (let [players (get-in response [:world :players])
                        objects (get-in response [:world :objects])
-                       resources (get-in response [:world :resources])]
+                       resources (player-resources (:world response) player-id)]
 
                    ;; Обновляем карту
                    (update-map panel players objects)
@@ -244,14 +238,15 @@
 ;; Создание панели ресурсов
 (defn create-resource-panel [resources]
   (let [panel (JPanel. (FlowLayout. FlowLayout/LEFT 20 10))
+        separator (JLabel. "|")
         wood-label (JLabel.
-                    (str "Дерево: " (:wood resources 0)))
+                    (str "Моё дерево: " (:wood resources 0)))
         stone-label (JLabel.
-                     (str "Камень: " (:stone resources 0)))]
+                     (str "Мой камень: " (:stone resources 0)))]
 
     (.setBackground panel (Color. 65 85 55))
 
-    (doseq [label [wood-label stone-label]]
+    (doseq [label [wood-label separator stone-label]]
       (.setForeground label Color/WHITE)
       (.setFont label (Font. "Arial" Font/BOLD 16))
       (.add panel label))
@@ -264,10 +259,10 @@
 ;; Обновление количества ресурсов
 (defn update-resource-panel [resource-ui resources]
   (.setText (:wood-label resource-ui)
-            (str "Дерево: " (:wood resources 0)))
+            (str "Моё дерево: " (:wood resources 0)))
 
   (.setText (:stone-label resource-ui)
-            (str "Камень: " (:stone resources 0))))
+            (str "Мой камень: " (:stone resources 0))))
 
 ;; Создание игрового окна
 (defn- confirm-dialog [message]
@@ -291,8 +286,8 @@
         response (client/request connection {:type :state})
         player (get-in response [:world :players player-id])
         map-panel (create-map-panel (:x player) (:y player))
-        resource-ui (create-resource-panel (get-in response [:world :resources]))
-        timer (start-map-updater map-panel connection resource-ui)]
+        resource-ui (create-resource-panel (player-resources (:world response) player-id))
+        timer (start-map-updater map-panel connection resource-ui player-id)]
     (doseq [[key direction] [[KeyEvent/VK_UP :up] [KeyEvent/VK_DOWN :down]
                              [KeyEvent/VK_LEFT :left] [KeyEvent/VK_RIGHT :right]]]
       (bind-key map-panel connection player-id key direction))

@@ -1,5 +1,6 @@
 (ns settlement.auth-test
   (:require [clojure.test :refer :all]
+            [clojure.string :as str]
             [clojure.java.io :as io]
             [settlement.auth :as auth]
             [settlement.world :as world]
@@ -159,7 +160,7 @@
 (deftest gui-key-bindings-test
   (register :a 1)
   (let [panel (gui/create-map-panel 0 0)
-        resource-ui (gui/create-resource-panel (:resources (world/get-world)))]
+        resource-ui (gui/create-resource-panel (gui/player-resources (world/get-world) 1))]
     (with-redefs [client/send-message (fn [_ _ message] (server/process-message :a message))]
       (gui/bind-gather-key panel {} resource-ui 1)
       (gui/bind-key panel {} 1 java.awt.event.KeyEvent/VK_RIGHT :right)
@@ -168,6 +169,43 @@
       (is (nil? (get-in (world/get-world) [:objects [1 0]])))
       (.actionPerformed (.get (.getActionMap panel) "move-right") nil)
       (is (= 1 (get-in (world/get-world) [:players 1 :x]))))))
+
+(defn- panel-text [ui]
+  (str/join " " (map #(.getText %) (.getComponents (:panel ui)))))
+
+(deftest personal-resource-panels-test
+  (register :a 1)
+  (register :b 2)
+  (server/process-message :b {:type :move :player-id 2 :direction :right})
+  (server/process-message :b {:type :move :player-id 2 :direction :right})
+  (is (= :ok (:status (server/process-message :b {:type :gather :player-id 2}))))
+  (javax.swing.SwingUtilities/invokeAndWait
+   (fn []
+     (let [panel-a (gui/create-map-panel 0 0)
+           panel-b (gui/create-map-panel 2 0)
+           ui-a (gui/create-resource-panel (gui/player-resources (world/get-world) 1))
+           ui-b (gui/create-resource-panel (gui/player-resources (world/get-world) 2))]
+       (is (= "Моё дерево: 0 | Мой камень: 0" (panel-text ui-a)))
+       (is (= "Моё дерево: 0 | Мой камень: 1" (panel-text ui-b)))
+       (with-redefs [client/send-message (fn [connection _ message]
+                                          (server/process-message connection message))]
+         (gui/bind-gather-key panel-a {:writer :a} ui-a 1)
+         (.actionPerformed (.get (.getActionMap panel-a) "gather") nil)
+         (is (= "Моё дерево: 1 | Мой камень: 0" (panel-text ui-a)))
+         (is (= "Моё дерево: 0 | Мой камень: 1" (panel-text ui-b)))
+         (let [timer-a (gui/start-map-updater panel-a {:writer :a} ui-a 1)
+               timer-b (gui/start-map-updater panel-b {:writer :b} ui-b 2)]
+           (try
+             ;; Вызываем настоящие обработчики опроса без ожидания таймера.
+             (doseq [timer [timer-a timer-b]
+                     listener (.getActionListeners timer)]
+               (.actionPerformed listener nil))
+             (is (= "Моё дерево: 1 | Мой камень: 0" (panel-text ui-a)))
+             (is (= "Моё дерево: 0 | Мой камень: 1" (panel-text ui-b)))
+             (finally (.stop timer-a) (.stop timer-b)))))
+       (is (= {:wood 1 :stone 0} (gui/player-resources (world/get-world) 1)))
+       (is (= {:wood 0 :stone 1} (gui/player-resources (world/get-world) 2)))
+       (is (= {:wood 1 :stone 1} (:resources (world/get-world))))))))
 
 (deftest two-tcp-clients-and-reconnect-test
   (with-open [listener (ServerSocket. 0)]
@@ -190,6 +228,9 @@
           (is (= :ok (:status (authorize b 2))))
           (is (= :ok (:status (client/request a {:type :gather :player-id 1}))))
           (client/request a {:type :move :player-id 1 :direction :down})
+          (client/request b {:type :move :player-id 2 :direction :right})
+          (client/request b {:type :move :player-id 2 :direction :right})
+          (is (= :ok (:status (client/request b {:type :gather :player-id 2}))))
           (let [before (world/get-world)
                 duplicate (open!)]
             (is (= :already-connected (:code (authorize duplicate 1))))
@@ -201,6 +242,10 @@
             (is (= before (world/get-world)))
             (is (= 1 (get-in before [:players 1 :y])))
             (is (= 1 (get-in before [:players 1 :collected :wood])))
+            (is (= {:wood 1 :stone 0} (gui/player-resources (world/get-world) 1)))
+            (is (= {:wood 0 :stone 1} (gui/player-resources (world/get-world) 2)))
+            (is (= "Моё дерево: 1 | Мой камень: 0"
+                   (panel-text (gui/create-resource-panel (gui/player-resources (world/get-world) 1)))))
             (is (= :ok (:status (client/request b {:type :move :player-id 2 :direction :down}))))))
         (finally
           (doseq [[connection handler] @connections]

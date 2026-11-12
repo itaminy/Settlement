@@ -3,6 +3,7 @@
             [settlement.server :as server]
             [settlement.auth :as auth]
             [settlement.auth-test]
+            [settlement.gui :as gui]
             [settlement.world :as world]))
 
 ;; Запуск: clojure -M -m settlement.world-test fast (или slow, all).
@@ -25,6 +26,30 @@
   (world/add-player id (str "Player " id))
   (dosync
     (alter world/world update-in [:players id] assoc :x x :y y)))
+
+(defn- neighbors [[x y]]
+  (filter (fn [[x y]] (and (<= 0 x 11) (<= 0 y 11)))
+          [[(inc x) y] [(dec x) y] [x (inc y)] [x (dec y)]]))
+
+(deftest initial-map-layout-test
+  (let [objects world/initial-objects
+        ;; Проверяем доступ даже без прохода через объекты.
+        reachable (loop [visited #{[0 0]} frontier #{[0 0]}]
+                    (let [next-cells (set (for [position frontier
+                                                neighbor (neighbors position)
+                                                :when (and (not (contains? objects neighbor))
+                                                           (not (contains? visited neighbor)))]
+                                            neighbor))]
+                      (if (empty? next-cells) visited
+                          (recur (into visited next-cells) next-cells))))]
+    (is (= {:tree 18 :stone 12 :house 3} (frequencies (vals objects))))
+    (is (= 33 (count objects)))
+    (is (not (contains? objects [0 0])))
+    (is (= gui/map-size 12))
+    (is (every? (fn [[x y]] (and (<= 0 x 11) (<= 0 y 11))) (keys objects)))
+    (is (= (- (* 12 12) (count objects)) (count reachable)))
+    (doseq [[position object] objects :when (#{:tree :stone} object)]
+      (is (some reachable (neighbors position)) (str "Resource accessible at " position)))))
 
 (deftest registration-test
   (world/add-player 1 "Alice")
@@ -185,6 +210,7 @@
 
 (deftest ^:slow scheduled-restore-after-30-seconds-test
   (place-player! 1 2 4)
+  (place-player! 2 6 2)
   (let [tasks (atom [])
         started (System/nanoTime)]
     (with-redefs [world/schedule-resource-restore
@@ -194,18 +220,26 @@
                       task))]
       (try
         (is (= :ok (:status (world/gather-resource 1))))
+        (is (= :ok (:status (world/gather-resource 2))))
         (is (nil? (get-in (world/get-world) [:objects [3 4]])))
+        (is (nil? (get-in (world/get-world) [:objects [7 2]])))
         (is (= :error (:status (world/gather-resource 1))))
-        (is (= 1 (count @tasks)))
+        (is (= :error (:status (world/gather-resource 2))))
+        (is (= 2 (count @tasks)))
         ;; Ждём завершения настоящей задачи, а не подменяем 30-секундный таймер.
         (doseq [task @tasks]
           (is (not= ::timeout (deref task 35000 ::timeout))))
         (is (>= (/ (- (System/nanoTime) started) 1e9) 30.0))
         (is (= :tree (get-in (world/get-world) [:objects [3 4]])))
-        (is (= {:wood 1 :stone 0} (:resources (world/get-world))))
+        (is (= :stone (get-in (world/get-world) [:objects [7 2]])))
+        (is (= {:wood 1 :stone 1} (:resources (world/get-world))))
         (is (= {:wood 1 :stone 0} (get-in (world/get-world) [:players 1 :collected])))
+        (is (= {:wood 0 :stone 1} (get-in (world/get-world) [:players 2 :collected])))
         (is (= :ok (:status (world/gather-resource 1))))
-        (is (= {:wood 2 :stone 0} (:resources (world/get-world))))
+        (is (= :ok (:status (world/gather-resource 2))))
+        (is (= {:wood 2 :stone 2} (:resources (world/get-world))))
+        (is (= {:wood 2 :stone 0} (get-in (world/get-world) [:players 1 :collected])))
+        (is (= {:wood 0 :stone 2} (get-in (world/get-world) [:players 2 :collected])))
         (finally
           (doseq [task @tasks] (future-cancel task)))))))
 
