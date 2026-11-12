@@ -1,5 +1,6 @@
 (ns settlement.inventory-test
   (:require [clojure.test :refer :all]
+            [settlement.layout :as layout]
             [settlement.test-support :as support]
             [settlement.inventory :as inventory]
             [settlement.inventory-ui :as inventory-ui]
@@ -13,7 +14,8 @@
 
 (use-fixtures :each
   (fn [f]
-    (with-redefs [world/gathering (ref {})
+    (with-redefs [layout/spawn-cells support/row-major-spawn
+                  world/gathering (ref {})
                   world/now-ns #(deref support/time-ns)
                   world/world (ref {:players {} :resources {:wood 0 :stone 0}
                                    :objects {[1 0] :tree [3 0] :stone}})

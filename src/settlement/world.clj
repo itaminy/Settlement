@@ -37,8 +37,7 @@
 (defn add-player [player-id name]
   (dosync
     (when-not (contains? (:players @world) player-id)
-      (when-let [[x y] (first (for [y (range config/world-height) x (range config/world-width)
-                                    :when (free-cell? @world [x y])] [x y]))]
+      (when-let [[x y] (first (filter #(free-cell? @world %) (layout/spawn-cells)))]
         (alter world assoc-in [:players player-id]
                {:name name :x x :y y :inventory inventory/empty-inventory})
         true))))

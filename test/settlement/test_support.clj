@@ -1,7 +1,11 @@
 (ns settlement.test-support
   (:require [settlement.world :as world]
             [settlement.server :as server]
-            [settlement.client :as client]))
+            [settlement.client :as client]
+            [settlement.config :as config]))
+
+(defn row-major-spawn []
+  (for [y (range config/world-height) x (range config/world-width)] [x y]))
 
 (def time-ns (atom 0))
 (defn advance! [ms] (swap! time-ns + (* ms 1000000)))

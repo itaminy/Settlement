@@ -3,7 +3,8 @@
             [settlement.config :as config]
             [settlement.layout :as layout])
   (:import [javax.imageio ImageIO]
-           [java.awt Color Font RenderingHints]
+           [java.awt Color Font RenderingHints BasicStroke]
+           [java.awt.geom Area Path2D$Double Ellipse2D$Double]
            [java.awt.image BufferedImage]))
 
 (def map-size config/world-width)
@@ -57,12 +58,13 @@
 
 (def sprite-sizes
   {:tree [100 112] :tree-alt [100 112] :stone [54 36] :stone-alt [54 36]
+   :tree-small [82 94] :tree-tall [108 124]
    :house [144 128] :bush [36 28] :flowers [38 28]
    :mushroom-red [22 22] :mushroom-green [22 22]
    :logs [30 52] :stump [38 24] :bench [62 30]})
 
 (def sprites
-  (into {} (for [[kind filename] sprite-files
+  (into {} (for [[kind filename] (assoc sprite-files :tree-small "pine_tree.png" :tree-tall "pine_tree.png")
                  :let [[width height] (sprite-sizes kind)]]
              [kind (scale-image (load-image (str "resources/images/new/" filename)) width height)])))
 
@@ -86,11 +88,41 @@
                     [index image])))
        :dirt dirt))))
 
+(def dirt-shape
+  (delay
+    (let [shape (Area.) stroke (BasicStroke. 44.0 BasicStroke/CAP_ROUND BasicStroke/JOIN_ROUND)]
+      (doseq [route layout/path-routes]
+        (let [points (mapv (fn [[x y]] [(+ 32 (* x tile-size)) (+ 32 (* y tile-size))])
+                           (concat [(first route)] route [(last route)]))
+              path (Path2D$Double.)]
+          (.moveTo path (double (get-in points [1 0])) (double (get-in points [1 1])))
+          (doseq [i (range 1 (- (count points) 2))]
+            (let [[ax ay] (points (dec i)) [bx by] (points i)
+                  [cx cy] (points (inc i)) [dx dy] (points (+ i 2))]
+              (.curveTo path (+ bx (/ (- cx ax) 6.0)) (+ by (/ (- cy ay) 6.0))
+                             (- cx (/ (- dx bx) 6.0)) (- cy (/ (- dy by) 6.0)) cx cy)))
+          (.add shape (Area. (.createStrokedShape stroke path)))))
+      (doseq [[x y] layout/house-positions]
+        (.add shape (Area. (Ellipse2D$Double. (* (- x 1.7) tile-size) (* (- y 0.2) tile-size)
+                                            (* 4.4 tile-size) (* 2.6 tile-size)))))
+      shape)))
+
+(defn- draw-terrain! [graphics camera]
+  (doseq [[x y] (visible-cells camera 0)]
+    (.drawImage graphics ^BufferedImage (get @terrain-tiles (layout/grass-variant [x y]))
+                (* x tile-size) (* y tile-size) nil))
+  (let [clip (.getClip graphics)]
+    (try
+      (.clip graphics ^Area @dirt-shape)
+      (doseq [[x y] (visible-cells camera 0)]
+        (.drawImage graphics ^BufferedImage (:dirt @terrain-tiles) (* x tile-size) (* y tile-size) nil))
+      (finally (.setClip graphics clip)))))
+
 (defn sprite-kind [[x y] object]
   (let [alternate? (odd? (+ x y))]
     (case object
       ;; Временно используем одну сосну: исходный alt PNG — чёрный силуэт.
-      :tree :tree
+      :tree (case (mod (+ (* x 17) (* y 31)) 7) 0 :tree-small 1 :tree-small 6 :tree-tall :tree)
       :stone (if alternate? :stone-alt :stone)
       object)))
 
@@ -107,7 +139,7 @@
   (->> (for [position (visible-cells camera 2)
              :let [object (get objects position)
                    kind (if object (sprite-kind position object) (get decorations position))]
-             :when kind
+             :when (and kind (not= kind :logs))
              :let [placement (sprite-placement position kind)]
              :when (intersects? camera placement)]
          placement)
@@ -137,10 +169,7 @@
     (try
       (.setRenderingHint graphics RenderingHints/KEY_INTERPOLATION RenderingHints/VALUE_INTERPOLATION_NEAREST_NEIGHBOR)
       (.translate graphics (- (:x camera)) (- (:y camera)))
-      (doseq [[x y] (visible-cells camera 0)]
-        (.drawImage graphics ^BufferedImage
-                    (get @terrain-tiles (if (road? x y) :dirt (mod (+ (* x 7) (* y 11)) 3)))
-                    (* x tile-size) (* y tile-size) nil))
+      (draw-terrain! graphics camera)
       (doseq [{:keys [image x y]} (scene-sprites objects camera)]
         (.drawImage graphics ^BufferedImage image (int x) (int y) nil))
       ;; Маркеры рисуются поверх крон и крыш, чтобы игрок не терялся за ними.

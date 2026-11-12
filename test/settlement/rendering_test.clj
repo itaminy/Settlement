@@ -3,7 +3,8 @@
             [settlement.gui :as gui]
             [settlement.rendering :as rendering]
             [settlement.world :as world]
-            [settlement.config :as config])
+            [settlement.config :as config]
+            [settlement.layout :as layout])
   (:import [java.awt Color]
            [java.awt.image BufferedImage]
            [java.util Arrays]))
@@ -105,10 +106,9 @@
          (finally (.dispose graphics)))))))
 
 (deftest terrain-and-stable-variants-test
-  (is (every? #(rendering/road? % 6) (range config/world-width)))
-  (is (every? #(rendering/road? 4 %) (range 3 9)))
-  (is (not (rendering/road? 3 5)))
-  (is (= #{:tree}
+  (is (every? #(apply rendering/road? %) layout/road-cells))
+  (is (apply rendering/road? layout/spawn-position))
+  (is (= #{:tree :tree-small :tree-tall}
          (set (for [[position object] world/initial-objects :when (= :tree object)]
                 (rendering/sprite-kind position object)))))
   (is (= #{:stone :stone-alt}

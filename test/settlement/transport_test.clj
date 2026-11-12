@@ -1,5 +1,6 @@
 (ns settlement.transport-test
   (:require [clojure.test :refer :all]
+            [settlement.layout :as layout]
             [settlement.transport :as transport] [settlement.client :as client]
             [settlement.gathering-ui :as gathering-ui] [settlement.world :as world]
             [settlement.auth :as auth] [settlement.server :as server]
@@ -76,7 +77,8 @@
 
 (defn- with-mining [f]
   (reset! support/time-ns 0)
-  (with-redefs [world/world (ref {:players {} :objects {[1 0] :tree} :resources {:wood 0 :stone 0}})
+  (with-redefs [layout/spawn-cells support/row-major-spawn
+                  world/world (ref {:players {} :objects {[1 0] :tree} :resources {:wood 0 :stone 0}})
                 world/gathering (ref {}) auth/state (ref (auth/new-state))
                 world/now-ns #(deref support/time-ns)
                 gathering-ui/now-ms #(quot @support/time-ns 1000000)

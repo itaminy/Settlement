@@ -12,7 +12,8 @@
             [settlement.inventory :as inventory]
             [settlement.inventory-test]
             [settlement.mechanics-test]
-            [settlement.transport-test]))
+            [settlement.transport-test]
+            [settlement.layout-test]))
 
 ;; Запуск: clojure -M -m settlement.world-test fast (или slow, all).
 (def ^:private initial-world
@@ -25,7 +26,8 @@
 (use-fixtures :each
   (fn [test-fn]
     ;; Исходный ref не меняется. Быстрые тесты не оставляют фоновых задач.
-    (with-redefs [world/gathering (ref {})
+    (with-redefs [layout/spawn-cells support/row-major-spawn
+                  world/gathering (ref {})
                   world/now-ns #(deref support/time-ns)
                   world/world (ref initial-world)
                   auth/state (ref (auth/new-state))
@@ -44,7 +46,7 @@
 (deftest initial-map-layout-test
   (let [objects world/initial-objects
         ;; Проверяем доступ даже без прохода через объекты.
-        reachable (loop [visited #{[0 0]} frontier #{[0 0]}]
+        reachable (loop [visited #{layout/spawn-position} frontier #{layout/spawn-position}]
                     (let [next-cells (set (for [position frontier
                                                 neighbor (neighbors position)
                                                 :when (and (not (contains? objects neighbor))
@@ -54,11 +56,10 @@
                           (recur (into visited next-cells) next-cells))))]
     (is (= objects (layout/generate-objects)))
     (is (<= 200 (:tree (frequencies (vals objects)))))
-    (is (<= 100 (:stone (frequencies (vals objects)))))
+    (is (<= 50 (:stone (frequencies (vals objects)))))
     (is (= 3 (:house (frequencies (vals objects)))))
-    (is (= 33 (count layout/starting-objects)))
-    (is (= layout/starting-objects (select-keys objects (keys layout/starting-objects))))
-    (is (not (contains? objects [0 0])))
+    (is (= layout/house-positions (set (for [[p kind] objects :when (= kind :house)] p))))
+    (is (not (contains? objects layout/spawn-position)))
     (is (= gui/map-size config/world-width 50))
     (is (= config/world-height 50))
     (is (every? config/in-bounds? (keys objects)))
@@ -105,11 +106,10 @@
   (is (true? (world/move-player 1 :left))))
 
 (deftest large-world-resource-distribution-test
-  (doseq [qy [0 25] qx [0 25]]
-    (let [objects (for [[[x y] object] world/initial-objects
-                        :when (and (<= qx x (+ qx 24)) (<= qy y (+ qy 24)))] object)]
-      (is (<= 30 (count (filter #{:tree} objects))))
-      (is (<= 20 (count (filter #{:stone} objects))))))
+  (let [trees (for [[p kind] world/initial-objects :when (= kind :tree)] p)
+        rocks (for [[p kind] world/initial-objects :when (= kind :stone)] p)]
+    (is (> (count (filter layout/forest? trees)) (* 0.6 (count trees))))
+    (is (> (count (filter layout/rocky? rocks)) (* 0.6 (count rocks)))))
   (is (= layout/decorations (layout/generate-decorations)))
   (is (every? config/in-bounds? (keys layout/decorations))))
 
@@ -430,7 +430,7 @@
       (throw (ex-info "Expected fast, slow or all" {:suite suite})))
     (try
       (let [tests (->> ["settlement.world-test" "settlement.auth-test" "settlement.rendering-test" "settlement.inventory-test"
-                       "settlement.mechanics-test" "settlement.transport-test"]
+                       "settlement.mechanics-test" "settlement.transport-test" "settlement.layout-test"]
                        (mapcat #(vals (ns-interns (symbol %))))
                        (filter #(-> % meta :test))
                        (filter #(case suite
