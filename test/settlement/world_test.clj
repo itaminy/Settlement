@@ -56,15 +56,15 @@
   (world/add-player 1 "Alice")
   (world/add-player 2 "Bob")
   (is (= {1 {:name "Alice" :x 0 :y 0 :collected {:wood 0 :stone 0}}
-          2 {:name "Bob" :x 0 :y 0 :collected {:wood 0 :stone 0}}}
+          2 {:name "Bob" :x 1 :y 0 :collected {:wood 0 :stone 0}}}
          (:players (world/get-world))))
   (is (= (dissoc initial-world :players)
          (dissoc (world/get-world) :players))))
 
 (deftest movement-test
-  (place-player! 1 5 5)
-  (doseq [[direction position] [[:up [5 4]] [:right [6 4]]
-                              [:down [6 5]] [:left [5 5]]]]
+  (place-player! 1 5 4)
+  (doseq [[direction position] [[:up [5 3]] [:right [6 3]]
+                              [:down [6 4]] [:left [5 4]]]]
     (is (true? (world/move-player 1 direction)))
     (is (= position ((juxt :x :y) (get-in (world/get-world) [:players 1])))))
   (is (= (:objects initial-world) (:objects (world/get-world))))
@@ -180,6 +180,143 @@
   (world/restore-resource [3 4] :stone)
   (is (= :tree (get-in (world/get-world) [:objects [3 4]]))))
 
+(defn- concurrently [actions]
+  (let [ready (java.util.concurrent.CountDownLatch. (count actions))
+        start (promise)
+        tasks (mapv #(future (.countDown ready)
+                             (when (= :go (deref start 5000 :timeout)) (%))) actions)]
+    (try
+      (is (.await ready 5 java.util.concurrent.TimeUnit/SECONDS))
+      (deliver start :go)
+      (mapv #(deref % 5000 ::timeout) tasks)
+      (finally
+        (deliver start :cancel)
+        (doseq [task tasks] (future-cancel task))))))
+
+(deftest object-collisions-and-server-response-test
+  (doseq [object [:tree :stone :house]]
+    (dosync (alter world/world assoc :objects {[2 2] object}))
+    (place-player! 1 1 2)
+    (dosync (alter auth/state assoc-in [:sessions 1] :a))
+    (let [before (world/get-world)
+          response (server/process-message :a {:type :move :player-id 1 :direction :right})]
+      (is (= :error (:status response)))
+      (is (= :object-blocked (:code response)))
+      (is (seq (:message response)))
+      (is (= before (world/get-world))))))
+
+(deftest movement-rejection-reasons-test
+  (place-player! 1 0 0)
+  (let [before (world/get-world)]
+    (is (= :out-of-bounds (:code (world/move-player-result 1 :up))))
+    (is (= :invalid-direction (:code (world/move-player-result 1 :teleport))))
+    (is (= :player-not-found (:code (world/move-player-result 99 :right))))
+    (is (= before (world/get-world)))))
+
+(deftest player-collision-and-offline-cell-test
+  (place-player! 1 1 1)
+  (place-player! 2 2 1)
+  (auth/disconnect! :offline)
+  (let [before (world/get-world)]
+    (is (= :player-blocked (:code (world/move-player-result 1 :right))))
+    (is (= before (world/get-world))))
+  (is (true? (world/move-player 2 :down)))
+  (is (true? (world/move-player 1 :right))))
+
+(deftest concurrent-movement-test
+  (place-player! 1 1 1)
+  (place-player! 2 3 1)
+  (let [results (concurrently [#(world/move-player-result 1 :right)
+                               #(world/move-player-result 2 :left)])
+        players (:players (world/get-world))]
+    (is (= {:ok 1 :error 1} (frequencies (map :status results))))
+    (is (= :player-blocked (:code (first (filter #(= :error (:status %)) results)))))
+    (is (= 1 (count (filter #(= [2 1] [(:x %) (:y %)]) (vals players)))))
+    (is (= 2 (count (set (map (juxt :x :y) (vals players))))))))
+
+(deftest spawn-search-in-row-order-test
+  (dosync (alter world/world assoc :objects {[0 0] :tree [1 0] :stone [2 0] :house}))
+  (doseq [id (range 1 15)] (is (true? (world/add-player id (str id)))))
+  (is (= (vec (take 14 (for [y (range 12) x (range 12)
+                             :when (not (#{[0 0] [1 0] [2 0]} [x y]))] [x y])))
+         (mapv #(let [p (get-in (world/get-world) [:players %])] [(:x p) (:y p)]) (range 1 15)))))
+
+(deftest gathered-cell-becomes-passable-test
+  (place-player! 1 2 4)
+  (place-player! 2 0 0)
+  (is (nil? (world/move-player 1 :right)))
+  (is (= :ok (:status (world/gather-resource 1))))
+  (is (true? (world/move-player 1 :right)))
+  (is (= [3 4] ((juxt :x :y) (get-in (world/get-world) [:players 1]))))
+  (is (= {:wood 1 :stone 0} (get-in (world/get-world) [:players 1 :collected])))
+  (is (= {:wood 0 :stone 0} (get-in (world/get-world) [:players 2 :collected]))))
+
+(deftest gathering-from-four-neighbors-only-test
+  (doseq [object [:tree :stone]
+          position [[1 2] [3 2] [2 1] [2 3]]]
+    (dosync (alter world/world assoc :objects {[2 2] object}))
+    (apply place-player! 1 position)
+    (is (= :ok (:status (world/gather-resource 1)))))
+  (doseq [position [[1 1] [3 1] [1 3] [3 3] [0 2] [2 0] [4 2] [2 4]]]
+    (dosync (alter world/world assoc :objects {[2 2] :tree}))
+    (apply place-player! 1 position)
+    (let [before (world/get-world)]
+      (is (= :error (:status (world/gather-resource 1))))
+      (is (= before (world/get-world))))))
+
+(deftest decorations-and-large-sprites-do-not-block-test
+  (dosync (alter world/world assoc :objects {[3 3] :house}))
+  (place-player! 1 1 2)
+  (is (true? (world/move-player 1 :right)))
+  ;; Логический дом в [3 3] не блокирует соседнюю клетку [3 2].
+  (is (true? (world/move-player 1 :right)))
+  (doseq [position (keys settlement.rendering/decorations)]
+    (dosync (alter world/world assoc :objects {}))
+    (let [[x y] position]
+      (if (pos? x)
+        (do (place-player! 1 (dec x) y) (is (true? (world/move-player 1 :right))))
+        (do (place-player! 1 1 y) (is (true? (world/move-player 1 :left))))))))
+
+(deftest safe-restore-and-retry-test
+  (place-player! 1 2 4)
+  (world/gather-resource 1)
+  (world/move-player 1 :right)
+  (is (= :occupied (world/restore-resource [3 4] :tree)))
+  (is (nil? (get-in (world/get-world) [:objects [3 4]])))
+  (let [delays (atom [])]
+    (with-redefs [world/wait-for-restore
+                  (fn [milliseconds]
+                    (swap! delays conj milliseconds)
+                    (when (= 3 (count @delays)) (world/move-player 1 :right)))]
+      (let [task (real-schedule-restore [3 4] :tree)]
+        (try
+          (is (not= ::timeout (deref task 5000 ::timeout)))
+          (is (= [30000 1000 1000] @delays))
+          (is (= :tree (get-in (world/get-world) [:objects [3 4]])))
+          (is (= :exists (world/restore-resource [3 4] :stone)))
+          (is (= :tree (get-in (world/get-world) [:objects [3 4]])))
+          (finally (future-cancel task)))))))
+
+(deftest concurrent-restoration-test
+  (dosync (alter world/world update :objects dissoc [3 4]))
+  (is (= {:restored 1 :exists 1}
+         (frequencies (concurrently [#(world/restore-resource [3 4] :tree)
+                                     #(world/restore-resource [3 4] :tree)]))))
+  (is (= :tree (get-in (world/get-world) [:objects [3 4]]))))
+
+(deftest restoration-racing-with-movement-test
+  (dosync (alter world/world update :objects dissoc [3 4]))
+  (place-player! 1 2 4)
+  (let [[movement restoration] (concurrently [#(world/move-player-result 1 :right)
+                                            #(world/restore-resource [3 4] :tree)])
+        state (world/get-world)]
+    (if (= :ok (:status movement))
+      (do (is (= :occupied restoration))
+          (is (nil? (get-in state [:objects [3 4]]))))
+      (do (is (= :object-blocked (:code movement)))
+          (is (= :restored restoration))
+          (is (= :tree (get-in state [:objects [3 4]])))))))
+
 (deftest concurrent-gather-test
   (place-player! 1 2 4)
   (place-player! 2 4 4)
@@ -227,6 +364,12 @@
         (is (= :error (:status (world/gather-resource 1))))
         (is (= :error (:status (world/gather-resource 2))))
         (is (= 2 (count @tasks)))
+        (is (true? (world/move-player 1 :right)))
+        ;; Камень восстановится через 30 секунд; дерево ждёт ухода игрока.
+        (is (not= ::timeout (deref (second @tasks) 35000 ::timeout)))
+        (is (nil? (get-in (world/get-world) [:objects [3 4]])))
+        (is (not (realized? (first @tasks))))
+        (is (true? (world/move-player 1 :left)))
         ;; Ждём завершения настоящей задачи, а не подменяем 30-секундный таймер.
         (doseq [task @tasks]
           (is (not= ::timeout (deref task 35000 ::timeout))))

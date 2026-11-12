@@ -24,17 +24,16 @@
 (defn register! [connection id name]
   (if-not (and (integer? id) (pos? id) (string? name) (not (empty? name)))
     (failure :invalid-registration)
-    (let [secret (token)]
-      (dosync
-        (cond
-          (owner connection) (failure :already-authenticated)
-          (contains? (:players (world/get-world)) id) (failure :player-exists)
-          :else
-          (do
-            (world/add-player id name)
-            (alter state assoc-in [:credentials id] (digest secret))
-            (alter state assoc-in [:sessions id] connection)
-            {:status :ok :token secret :server-instance (:instance @state)}))))))
+    (dosync
+      (cond
+        (owner connection) (failure :already-authenticated)
+        (contains? (:players (world/get-world)) id) (failure :player-exists)
+        (not (world/add-player id name)) (failure :map-full)
+        :else
+        (let [secret (token)]
+          (alter state assoc-in [:credentials id] (digest secret))
+          (alter state assoc-in [:sessions id] connection)
+          {:status :ok :token secret :server-instance (:instance @state)})))))
 
 (defn login! [connection id secret instance]
   (dosync

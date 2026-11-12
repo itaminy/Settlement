@@ -25,9 +25,10 @@
          (nil? id) (auth/failure :not-authenticated)
          (not= id player-id) (auth/failure :wrong-player)
          (= type :gather) (world/gather-resource id)
-         :else (if (world/move-player id direction)
-                 {:status :ok :world (world/get-world)}
-                 (auth/failure :invalid-movement))))
+         :else (let [result (world/move-player-result id direction)]
+                 (if (= :ok (:status result))
+                   (assoc result :world (world/get-world))
+                   result))))
      (auth/failure :unknown-command))))
 
 (defn handle-client [^Socket socket]

@@ -23,19 +23,23 @@
 
     :objects initial-objects}))
 
-;; Регистрация игрока
+(defn player-at? [state position]
+  (boolean (some #(= position [(:x %) (:y %)]) (vals (:players state)))))
+
+(defn free-cell? [state [x y :as position]]
+  (and (<= 0 x 11) (<= 0 y 11)
+       (not (contains? (:objects state) position))
+       (not (player-at? state position))))
+
+;; Поиск и создание выполняются в одной транзакции, включая внешнюю auth-транзакцию.
 (defn add-player [player-id name]
   (dosync
     (when-not (contains? (:players @world) player-id)
-      (alter world assoc-in
-           [:players player-id]
-           {:name name
-            :x 0
-            :y 0
-            ;; Личный запас; :resources мира используется только для статистики.
-            :collected {:wood 0
-                        :stone 0}})
-      true)))
+      (when-let [[x y] (first (for [y (range 12) x (range 12)
+                                    :when (free-cell? @world [x y])] [x y]))]
+        (alter world assoc-in [:players player-id]
+               {:name name :x x :y y :collected {:wood 0 :stone 0}})
+        true))))
 
 ;; Добыча ресурсов
 (defn collect-resource [player-id resource amount]
@@ -55,25 +59,33 @@
 (defn get-world []
   @world)
 
-;; Перемещение игрока
-(defn move-player [player-id direction]
+(defn move-player-result [player-id direction]
   (dosync
-    (when (contains? (:players @world) player-id)
-      (let [{:keys [x y]} (get-in @world [:players player-id])
-            [new-x new-y] (case direction
-                            :up    [x (dec y)]
-                            :down  [x (inc y)]
-                            :left  [(dec x) y]
-                            :right [(inc x) y]
-                            [x y])]
-        (when (and (<= 0 new-x 11)
-                   (<= 0 new-y 11))
-          (alter world assoc-in
-                 [:players player-id :x] new-x)
-          (alter world assoc-in
-                 [:players player-id :y] new-y)
-          true)))))
+    (let [state @world
+          player (get-in state [:players player-id])
+          delta ({:up [0 -1] :down [0 1] :left [-1 0] :right [1 0]} direction)
+          fail (fn [code message] {:status :error :code code :message message})]
+      (cond
+        (nil? player) (fail :player-not-found "Player not found")
+        (nil? delta) (fail :invalid-direction "Unknown movement direction")
+        :else
+        (let [[dx dy] delta
+              x (+ (:x player) dx) y (+ (:y player) dy)
+              position [x y]]
+          (cond
+            (not (and (<= 0 x 11) (<= 0 y 11)))
+            (fail :out-of-bounds "Destination is outside the map")
+            (contains? (:objects state) position)
+            (fail :object-blocked "Destination is occupied by an object")
+            (player-at? state position)
+            (fail :player-blocked "Destination is occupied by another player")
+            :else
+            (do (alter world update-in [:players player-id] assoc :x x :y y)
+                {:status :ok})))))))
 
+;; Сохраняем прежний интерфейс для внутренних вызовов.
+(defn move-player [player-id direction]
+  (when (= :ok (:status (move-player-result player-id direction))) true))
 
 (declare schedule-resource-restore)
 ;; Добыча ресурса с удалением объекта
@@ -126,14 +138,20 @@
 
 
 
-;; Восстановление добытого объекта
 (defn restore-resource [position object]
   (dosync
-    (when-not (get-in @world [:objects position])
-      (alter world assoc-in [:objects position] object))))
+    (cond
+      (contains? (:objects @world) position) :exists
+      (player-at? @world position) :occupied
+      :else (do (alter world assoc-in [:objects position] object) :restored))))
 
-;; Планирование восстановления через 30 секунд
+(defn wait-for-restore [milliseconds]
+  (Thread/sleep milliseconds))
+
 (defn schedule-resource-restore [position object]
   (future
-    (Thread/sleep 30000)
-    (restore-resource position object)))
+    (wait-for-restore 30000)
+    (loop []
+      (when (= :occupied (restore-resource position object))
+        (wait-for-restore 1000)
+        (recur)))))

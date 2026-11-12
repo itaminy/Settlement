@@ -93,6 +93,76 @@
         (is (= {:ok 1 :error 1}
                (frequencies (map :status (mapv #(deref % 5000 {:status :timeout}) tasks)))))))))
 
+(defn- fill-map-except! [free-positions]
+  (dosync
+    (alter world/world assoc :objects
+           (into {} (for [y (range 12) x (range 12)
+                          :when (not (free-positions [x y]))]
+                      [[x y] :house])))))
+
+(deftest full-map-registration-is-atomic-test
+  (fill-map-except! #{})
+  (let [before (world/get-world)
+        auth-before @auth/state
+        response (register :a 1)]
+    (is (= {:status :error :code :map-full} response))
+    (is (= before (world/get-world)))
+    (is (= auth-before @auth/state))
+    (is (nil? (auth/owner :a)))))
+
+(deftest concurrent-registration-for-last-cell-test
+  (fill-map-except! #{[0 0]})
+  (let [ready (java.util.concurrent.CountDownLatch. 2)
+        start (promise)
+        tasks (mapv (fn [id]
+                      (future (.countDown ready)
+                              (when (= :go (deref start 5000 :timeout)) (register id id)))) [1 2])]
+    (try
+      (is (.await ready 5 java.util.concurrent.TimeUnit/SECONDS))
+      (deliver start :go)
+      (let [responses (mapv #(deref % 5000 {:status :timeout}) tasks)
+            ids (set (keys (:players (world/get-world))))]
+        (is (= {:ok 1 :error 1} (frequencies (map :status responses))))
+        (is (= :map-full (:code (first (filter #(= :error (:status %)) responses)))))
+        (is (= 1 (count ids)))
+        (is (= ids (set (keys (:credentials @auth/state)))))
+        (is (= ids (set (keys (:sessions @auth/state)))))
+        (is (= [0 0] ((juxt :x :y) (first (vals (:players (world/get-world))))))))
+      (finally
+        (deliver start :cancel)
+        (doseq [task tasks] (future-cancel task))))))
+
+(deftest simultaneous-registration-uses-distinct-cells-test
+  (let [start (promise)
+        tasks (mapv #(future @start (register % %)) [1 2])]
+    (try
+      (deliver start true)
+      (is (every? #(= :ok (:status (deref % 5000 {}))) tasks))
+      (is (= #{[0 0] [2 0]}
+             (set (map (juxt :x :y) (vals (:players (world/get-world)))))))
+      (finally (doseq [task tasks] (future-cancel task))))))
+
+(deftest registration-failure-rolls-back-player-test
+  (let [before (world/get-world) auth-before @auth/state]
+    (with-redefs-fn {#'auth/digest (fn [_] (throw (Exception. "Injected failure")))}
+      #(is (thrown? Exception (register :a 1))))
+    (is (= before (world/get-world)))
+    (is (= auth-before @auth/state))))
+
+(deftest disconnected-player-reserves-position-test
+  (let [registration (register :a 1)]
+    (auth/disconnect! :a)
+    (register :b 2)
+    (is (= [2 0] ((juxt :x :y) (get-in (world/get-world) [:players 2]))))
+    (is (= :object-blocked (:code (server/process-message :b {:type :move :player-id 2 :direction :left}))))
+    ;; Клетка [1 0] занята деревом, поэтому сначала освобождаем её добычей.
+    (is (= :ok (:status (server/process-message :b {:type :gather :player-id 2}))))
+    (is (= :wood (:resource (server/process-message :b {:type :gather :player-id 2}))))
+    (is (= :ok (:status (server/process-message :b {:type :move :player-id 2 :direction :left}))))
+    (is (= :player-blocked (:code (server/process-message :b {:type :move :player-id 2 :direction :left}))))
+    (is (= :ok (:status (login :reconnected 1 registration))))
+    (is (= [0 0] ((juxt :x :y) (get-in (world/get-world) [:players 1]))))))
+
 (deftest credentials-storage-test
   (is (nil? (credentials/load-entry "server" 1)))
   (let [tasks (mapv (fn [id] (future (credentials/save-entry! "server" id "old" (str "secret-" id)))) [1 2])]
@@ -176,8 +246,7 @@
 (deftest personal-resource-panels-test
   (register :a 1)
   (register :b 2)
-  (server/process-message :b {:type :move :player-id 2 :direction :right})
-  (server/process-message :b {:type :move :player-id 2 :direction :right})
+  (is (= [2 0] ((juxt :x :y) (get-in (world/get-world) [:players 2]))))
   (is (= :ok (:status (server/process-message :b {:type :gather :player-id 2}))))
   (javax.swing.SwingUtilities/invokeAndWait
    (fn []
@@ -228,8 +297,7 @@
           (is (= :ok (:status (authorize b 2))))
           (is (= :ok (:status (client/request a {:type :gather :player-id 1}))))
           (client/request a {:type :move :player-id 1 :direction :down})
-          (client/request b {:type :move :player-id 2 :direction :right})
-          (client/request b {:type :move :player-id 2 :direction :right})
+          (is (= [2 0] ((juxt :x :y) (get-in (world/get-world) [:players 2]))))
           (is (= :ok (:status (client/request b {:type :gather :player-id 2}))))
           (let [before (world/get-world)
                 duplicate (open!)]
