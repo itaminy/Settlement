@@ -1,0 +1,184 @@
+(ns settlement.world-test
+  (:require [clojure.test :refer :all]
+            [settlement.world :as world]))
+
+;; Запуск: clojure -M -m settlement.world-test fast (или slow, all).
+(def ^:private initial-world
+  {:resources {:wood 0 :stone 0}
+   :players {}
+   :objects {[3 4] :tree [7 2] :stone [8 6] :house [5 5] :tree}})
+
+(def ^:private real-schedule-restore world/schedule-resource-restore)
+
+(use-fixtures :each
+  (fn [test-fn]
+    ;; Исходный ref не меняется. Быстрые тесты не оставляют фоновых задач.
+    (with-redefs [world/world (ref initial-world)
+                  world/schedule-resource-restore (fn [_ _] nil)]
+      (test-fn))))
+
+(defn- place-player! [id x y]
+  (world/add-player id (str "Player " id))
+  (dosync
+    (alter world/world update-in [:players id] assoc :x x :y y)))
+
+(deftest registration-test
+  (world/add-player 1 "Alice")
+  (world/add-player 2 "Bob")
+  (is (= {1 {:name "Alice" :x 0 :y 0 :collected {:wood 0 :stone 0}}
+          2 {:name "Bob" :x 0 :y 0 :collected {:wood 0 :stone 0}}}
+         (:players (world/get-world))))
+  (is (= (dissoc initial-world :players)
+         (dissoc (world/get-world) :players))))
+
+(deftest movement-test
+  (place-player! 1 5 5)
+  (doseq [[direction position] [[:up [5 4]] [:right [6 4]]
+                              [:down [6 5]] [:left [5 5]]]]
+    (is (true? (world/move-player 1 direction)))
+    (is (= position ((juxt :x :y) (get-in (world/get-world) [:players 1])))))
+  (is (= (:objects initial-world) (:objects (world/get-world))))
+  (is (= {:wood 0 :stone 0} (:resources (world/get-world)))))
+
+(deftest map-boundaries-test
+  (doseq [[x y direction] [[0 0 :up] [0 0 :left]
+                           [11 11 :down] [11 11 :right]]]
+    (place-player! 1 x y)
+    (let [before (world/get-world)]
+      (is (nil? (world/move-player 1 direction)))
+      (is (= before (world/get-world))))))
+
+(deftest unknown-player-test
+  (is (nil? (world/move-player 99 :right)))
+  (is (nil? (world/collect-resource 99 :wood 5)))
+  (is (= {:status :error :message "Player not found"}
+         (world/gather-resource 99)))
+  (is (= initial-world (world/get-world))))
+
+(deftest resource-accounting-test
+  (world/add-player 1 "Alice")
+  (world/add-player 2 "Bob")
+  (is (true? (world/collect-resource 1 :wood 5)))
+  (is (true? (world/collect-resource 1 :stone 2)))
+  (is (true? (world/collect-resource 2 :wood 3)))
+  (is (= {:wood 8 :stone 2} (:resources (world/get-world))))
+  (is (= {:wood 5 :stone 2} (get-in (world/get-world) [:players 1 :collected])))
+  (is (= {:wood 3 :stone 0} (get-in (world/get-world) [:players 2 :collected])))
+  (is (= (:objects initial-world) (:objects (world/get-world)))))
+
+(deftest gather-tree-and-stone-test
+  (doseq [[position resource player-position]
+          [[[3 4] :wood [2 4]] [[7 2] :stone [6 2]]]]
+    (let [[x y] player-position
+          scheduled (atom [])]
+      (place-player! 1 x y)
+      (with-redefs [world/schedule-resource-restore
+                    (fn [pos object] (swap! scheduled conj [pos object]))]
+        (let [before (world/get-world)
+              object (get-in before [:objects position])]
+          (is (= {:status :ok :resource resource :amount 1 :position position}
+                 (world/gather-resource 1)))
+          (is (= (update (:resources before) resource inc)
+                 (:resources (world/get-world))))
+          (is (= (update (get-in before [:players 1 :collected]) resource inc)
+                 (get-in (world/get-world) [:players 1 :collected])))
+          (is (= (dissoc (:objects before) position) (:objects (world/get-world))))
+          (is (= [[position object]] @scheduled))
+          (let [after (world/get-world)]
+            (is (= {:status :error :message "No resource nearby"}
+                   (world/gather-resource 1)))
+            (is (= after (world/get-world)))
+            (is (= 1 (count @scheduled)))))))))
+
+(deftest no-adjacent-resource-test
+  ;; Диагональ, объект под игроком и дом не подходят для добычи.
+  (doseq [[x y] [[0 0] [2 3] [3 4] [8 5]]]
+    (place-player! 1 x y)
+    (let [before (world/get-world)]
+      (is (= {:status :error :message "No resource nearby"}
+             (world/gather-resource 1)))
+      (is (= before (world/get-world))))))
+
+(deftest restore-resource-test
+  (dosync (alter world/world update :objects dissoc [3 4]))
+  (world/restore-resource [3 4] :tree)
+  (is (= initial-world (world/get-world)))
+  (world/restore-resource [3 4] :stone)
+  (is (= :tree (get-in (world/get-world) [:objects [3 4]]))))
+
+(deftest concurrent-gather-test
+  (place-player! 1 2 4)
+  (place-player! 2 4 4)
+  (let [ready (java.util.concurrent.CountDownLatch. 2)
+        start (promise)
+        scheduled (atom [])]
+    (with-redefs [world/schedule-resource-restore
+                  (fn [pos object] (swap! scheduled conj [pos object]))]
+      (let [tasks (mapv (fn [id]
+                          (future
+                            (.countDown ready)
+                            (when (= :go (deref start 5000 :timeout))
+                              (world/gather-resource id))))
+                        [1 2])]
+        (try
+          (is (.await ready 5 java.util.concurrent.TimeUnit/SECONDS))
+          (deliver start :go)
+          (let [results (mapv #(deref % 5000 :timeout) tasks)
+                state (world/get-world)]
+            (is (= {:ok 1 :error 1} (frequencies (map :status results))))
+            (is (= {:wood 1 :stone 0} (:resources state)))
+            (is (= [0 1] (sort (map #(get-in state [:players % :collected :wood]) [1 2]))))
+            (is (every? zero? (map #(get-in state [:players % :collected :stone]) [1 2])))
+            (is (= (dissoc (:objects initial-world) [3 4]) (:objects state)))
+            (is (= [[[3 4] :tree]] @scheduled)))
+          (finally
+            (deliver start :cancel)
+            (doseq [task tasks] (future-cancel task))))))))
+
+(deftest ^:slow scheduled-restore-after-30-seconds-test
+  (place-player! 1 2 4)
+  (let [tasks (atom [])
+        started (System/nanoTime)]
+    (with-redefs [world/schedule-resource-restore
+                  (fn [pos object]
+                    (let [task (real-schedule-restore pos object)]
+                      (swap! tasks conj task)
+                      task))]
+      (try
+        (is (= :ok (:status (world/gather-resource 1))))
+        (is (nil? (get-in (world/get-world) [:objects [3 4]])))
+        (is (= :error (:status (world/gather-resource 1))))
+        (is (= 1 (count @tasks)))
+        ;; Ждём завершения настоящей задачи, а не подменяем 30-секундный таймер.
+        (doseq [task @tasks]
+          (is (not= ::timeout (deref task 35000 ::timeout))))
+        (is (>= (/ (- (System/nanoTime) started) 1e9) 30.0))
+        (is (= :tree (get-in (world/get-world) [:objects [3 4]])))
+        (is (= {:wood 1 :stone 0} (:resources (world/get-world))))
+        (is (= {:wood 1 :stone 0} (get-in (world/get-world) [:players 1 :collected])))
+        (is (= :ok (:status (world/gather-resource 1))))
+        (is (= {:wood 2 :stone 0} (:resources (world/get-world))))
+        (finally
+          (doseq [task @tasks] (future-cancel task)))))))
+
+(defn -main [& [suite]]
+  (let [suite (or suite "fast")]
+    (when-not (#{"fast" "slow" "all"} suite)
+      (throw (ex-info "Expected fast, slow or all" {:suite suite})))
+    (try
+      (let [tests (->> (ns-interns 'settlement.world-test)
+                       vals
+                       (filter #(-> % meta :test))
+                       (filter #(case suite
+                                  "fast" (not (:slow (meta %)))
+                                  "slow" (:slow (meta %))
+                                  "all" true))
+                       (sort-by #(-> % meta :name)))
+            result (binding [*report-counters* (ref *initial-report-counters*)]
+                     (test-vars tests)
+                     (let [result @*report-counters*]
+                       (do-report (assoc result :type :summary))
+                       result))]
+        (when (pos? (+ (:fail result) (:error result)))
+          (System/exit 1)))
+      (finally (shutdown-agents)))))
