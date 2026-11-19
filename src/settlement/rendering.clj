@@ -265,18 +265,21 @@
 (def player-colors [(Color. 52 151 234) (Color. 242 155 45)
                     (Color. 171 100 220) (Color. 224 91 111)])
 
+(def ^:private team-colors {:blue (Color. 52 151 234) :red (Color. 220 60 65)})
+
 (defn player-markers [players]
   (mapcat
    (fn [[[x y] occupants]]
      (let [occupants (sort-by key occupants)
            count-players (count occupants)]
        (map-indexed
-        (fn [index [id _]]
+        (fn [index [id player]]
           {:id id
            :x (+ (* x tile-size) (quot tile-size 2)
                  (int (* 34 (- index (/ (dec count-players) 2.0)))))
            :y (+ (* y tile-size) 37)
-           :color (nth player-colors (mod id (count player-colors)))})
+           :color (or (team-colors (:team player))
+                      (nth player-colors (mod id (count player-colors))))})
         occupants)))
    (sort-by key (group-by (fn [[_ player]] [(:x player) (:y player)]) players))))
 

@@ -26,6 +26,31 @@
 ;; defonce сохраняет мир при перезагрузке namespace в работающем сервере.
 (migrate-inventories!)
 
+(defn- smaller-team [players]
+  (let [{:keys [blue red] :or {blue 0 red 0}} (frequencies (map :team (vals players)))]
+    (if (<= blue red) :blue :red)))
+
+(defn migrate-teams! []
+  (dosync
+    (alter world
+           (fn [{:keys [players objects] :as state}]
+             (let [players (reduce (fn [assigned id]
+                                     (if (nil? (get-in assigned [id :team]))
+                                       (assoc-in assigned [id :team] (smaller-team assigned))
+                                       assigned))
+                                   players (sort (keys players)))
+                   objects (reduce-kv (fn [assigned position object]
+                                        (if-let [team (and (buildings/building? object)
+                                                           (nil? (:team object))
+                                                           (get-in players [(:owner-id object) :team]))]
+                                          (assoc-in assigned [position :team] team)
+                                          assigned))
+                                      objects objects)]
+               (assoc state :players players :objects objects)))))
+  nil)
+
+(migrate-teams!)
+
 (defn player-at? [state position]
   (boolean (some #(= position [(:x %) (:y %)]) (vals (:players state)))))
 
@@ -41,7 +66,8 @@
       (when-let [[x y] (let [accessible (buildings/spawn-accessible-cells (:objects @world))]
                         (first (filter #(and (accessible %) (free-cell? @world %)) (layout/spawn-cells))))]
         (alter world assoc-in [:players player-id]
-               {:name name :x x :y y :inventory inventory/empty-inventory})
+               {:name name :x x :y y :inventory inventory/empty-inventory
+                :team (smaller-team (:players @world))})
         true))))
 
 (defn change-player-items! [player-id changes]

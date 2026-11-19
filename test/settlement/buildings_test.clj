@@ -46,7 +46,7 @@
   (is (= {:wood 13 :stone 10 :axe 0 :pickaxe 0} (items 1)))
   (let [objects (:objects (world/get-world))]
     (is (= 2 (count objects)))
-    (is (= {:type :building :kind :house :owner-id 1} (objects [11 10])))
+    (is (= {:type :building :kind :house :owner-id 1 :team :blue} (objects [11 10])))
     (is (= #{[11 10] [12 10] [11 11] [12 11] [10 11]} (buildings/occupied-cells objects)))
     (is (not (contains? objects [12 11])))))
 
@@ -107,9 +107,10 @@
     (is (= :ok (:status (server/process-message 1 {:type :build-check :player-id 1 :building-type :fence :position [11 10]}))))
     (is (= before (world/get-world))))
   (is (= :ok (:status (server/process-message 1 {:type :build :player-id 1 :building-type :fence :position [11 10]
-                                                 :cost {:wood 0} :owner-id 99 :size [0 0]}))))
+                                                 :cost {:wood 0} :owner-id 99 :team :red :size [0 0]}))))
   (is (= 8 (:wood (items 1))))
-  (is (= 1 (get-in (world/get-world) [:objects [11 10] :owner-id]))))
+  (is (= {:owner-id 1 :team :blue}
+         (select-keys (get-in (world/get-world) [:objects [11 10]]) [:owner-id :team]))))
 
 (deftest concurrent-building-and-spending-test
   (player! 1 [10 10] {:wood 2}) (player! 2 [12 10] {:wood 2})
@@ -271,7 +272,10 @@
             (world/change-player-items! id {:wood 10}))
           (is (= :ok (:status (client/request a {:type :build :player-id 1 :building-type :fence :position [11 10]}))))
           (let [state (:world (client/request b {:type :state}))]
-            (is (= {:type :building :kind :fence :owner-id 1} (get-in state [:objects [11 10]]))))
+            (is (= state (:world (client/request a {:type :state}))))
+            (is (= [:blue :red] (mapv #(get-in state [:players % :team]) [1 2])))
+            (is (= {:type :building :kind :fence :owner-id 1 :team :blue}
+                   (get-in state [:objects [11 10]]))))
           (is (= :object-blocked (:code (client/request b {:type :move :player-id 2 :direction :left})))))
         (finally
           (doseq [[connection handler] @connections]

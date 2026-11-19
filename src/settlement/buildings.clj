@@ -60,7 +60,7 @@
       (not (and (vector? position) (= 2 (count position)) (every? integer? position))) (fail :invalid-position)
       (not (config/in-bounds? position)) (fail :out-of-bounds)
       :else
-      (let [entry {:type :building :kind kind :owner-id player-id}
+      (let [entry {:type :building :kind kind :owner-id player-id :team (:team player)}
             footprint (vec (cells position entry))
             player-positions (set (map (juxt :x :y) (vals (:players state))))
             items (:items (inventory/player-inventory player))]

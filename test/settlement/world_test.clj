@@ -71,11 +71,32 @@
 (deftest registration-test
   (world/add-player 1 "Alice")
   (world/add-player 2 "Bob")
-  (is (= {1 {:name "Alice" :x 0 :y 0 :inventory inventory/empty-inventory :collected {:wood 0 :stone 0}}
-          2 {:name "Bob" :x 1 :y 0 :inventory inventory/empty-inventory :collected {:wood 0 :stone 0}}}
+  (is (= {1 {:name "Alice" :x 0 :y 0 :team :blue :inventory inventory/empty-inventory :collected {:wood 0 :stone 0}}
+          2 {:name "Bob" :x 1 :y 0 :team :red :inventory inventory/empty-inventory :collected {:wood 0 :stone 0}}}
          (:players (world/get-world))))
   (is (= (dissoc initial-world :players)
          (dissoc (world/get-world) :players))))
+
+(deftest migrate-teams-test
+  (let [players {3 {:name "Existing" :x 2 :y 0 :team :blue}
+                 2 {:name "Legacy 2" :x 1 :y 0 :inventory inventory/empty-inventory}
+                 1 {:name "Legacy 1" :x 0 :y 0 :collected {:wood 3 :stone 2}}}
+        fence {:type :building :kind :fence :owner-id 1}
+        assigned (assoc fence :team :blue)
+        orphan (assoc fence :owner-id 99)
+        objects (assoc (:objects initial-world)
+                       [10 10] fence [11 10] assigned [12 10] orphan)]
+    (dosync (alter world/world assoc :players players :objects objects))
+    (world/migrate-teams!)
+    (let [migrated @world/world]
+      (is (= {1 :red 2 :blue 3 :blue}
+             (into {} (map (fn [[id player]] [id (:team player)])) (:players migrated))))
+      (is (= (update-vals players #(dissoc % :team))
+             (update-vals (:players migrated) #(dissoc % :team))))
+      (is (= (assoc-in objects [[10 10] :team] :red) (:objects migrated)))
+      (is (= (:resources initial-world) (:resources migrated)))
+      (world/migrate-teams!)
+      (is (= migrated @world/world)))))
 
 (deftest movement-test
   (place-player! 1 5 4)

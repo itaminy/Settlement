@@ -80,6 +80,15 @@
     (doseq [{:keys [x y color]} markers]
       (is (= (.getRGB ^Color color) (.getRGB image x (+ y 10)))))))
 
+(deftest team-marker-colors-test
+  (let [markers (rendering/player-markers {1 {:x 0 :y 0 :team :blue}
+                                           2 {:x 0 :y 0 :team :red}
+                                           3 {:x 0 :y 0}})
+        [blue red legacy] (map :color markers)]
+    (is (> (.getBlue ^Color blue) (.getRed ^Color blue)))
+    (is (> (.getRed ^Color red) (.getBlue ^Color red)))
+    (is (= (nth rendering/player-colors 3) legacy))))
+
 (deftest map-panel-and-disappearing-object-test
   (javax.swing.SwingUtilities/invokeAndWait
    (fn []

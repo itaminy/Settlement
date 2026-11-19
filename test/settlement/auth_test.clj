@@ -81,6 +81,7 @@
       (auth/disconnect! :a)
       (is (= 1 (auth/owner :b)))
       (is (= before (world/get-world)))
+      (is (= :blue (get-in (world/get-world) [:players 1 :team])))
       (is (= {:wood 1 :stone 0} (get-in before [:players 1 :collected])))
       (is (= 1 (get-in before [:players 1 :y]))))))
 
@@ -144,6 +145,8 @@
     (try
       (deliver start true)
       (is (every? #(= :ok (:status (deref % 5000 {}))) tasks))
+      (is (= {:blue 1 :red 1}
+             (frequencies (map :team (vals (:players (world/get-world)))))))
       (is (= #{[0 0] [2 0]}
              (set (map (juxt :x :y) (vals (:players (world/get-world)))))))
       (finally (doseq [task tasks] (future-cancel task))))))
@@ -159,6 +162,10 @@
   (let [registration (register :a 1)]
     (auth/disconnect! :a)
     (register :b 2)
+    (is (= :red (get-in (world/get-world) [:players 2 :team])))
+    (is (= :ok (:status (server/process-message :c {:type :register :player-id 3
+                                                   :name "Player 3" :team :red}))))
+    (is (= :blue (get-in (world/get-world) [:players 3 :team])))
     (is (= [2 0] ((juxt :x :y) (get-in (world/get-world) [:players 2]))))
     (is (= :object-blocked (:code (support/process-message :b {:type :move :player-id 2 :direction :left}))))
     ;; Клетка [1 0] занята деревом, поэтому сначала освобождаем её добычей.

@@ -113,6 +113,8 @@
 (deftest craft-costs-and-tools-survive-reconnect-test
   (let [registration (register! 1)]
     (register! 2)
+    (is (= :blue (get-in (world/get-world) [:players 1 :team])))
+    (is (= :red (get-in (world/get-world) [:players 2 :team])))
     (world/change-player-items! 1 {:wood 5 :stone 5})
     (doseq [tool [:axe :pickaxe]]
       (is (= :ok (:status (server/process-message 1 {:type :craft :player-id 1 :tool tool})))))
@@ -146,6 +148,7 @@
 
 (deftest two-miners-only-one-award-test
   (register! 1) (register! 2)
+  (is (= [:blue :red] (mapv #(get-in (world/get-world) [:players % :team]) [1 2])))
   (dosync (alter world/world update :objects dissoc [3 0]))
   (let [a (start! 1) b (start! 2) restores (atom 0)]
     (hold! {1 a 2 b} 3000)
