@@ -254,7 +254,56 @@
       (is (= 1 (get-in (world/get-world) [:players 1 :x]))))))
 
 (defn- panel-text [ui]
-  (str/join " " (map #(.getText %) (.getComponents (:panel ui)))))
+  (str/join " | " (map #(.getText (ui %)) [:wood-label :stone-label])))
+
+(deftest score-panel-follows-server-state-test
+  (javax.swing.SwingUtilities/invokeAndWait
+   (fn []
+     (let [map-panel (gui/create-map-panel 0 0 1)
+           ui (gui/create-resource-panel {:wood 0 :stone 0})
+           state {:players {1 {:x 0 :y 0 :collected {:wood 7 :stone 4}}}
+                  :objects {}
+                  :match {:scores {:blue 17 :red 30} :phase :active}}
+           response (atom {:status :ok :world state})
+           labels (fn [] (mapv #(.getText (ui %)) [:blue-label :red-label :goal-label]))]
+       (is (= ["Синие: 0" "Красные: 0" "Цель: 100"] (labels)))
+       (with-redefs [client/async! (fn [_ _ request callback]
+                                     (is (= {:type :state} request))
+                                     (callback @response))]
+         (gui/refresh! map-panel {} ui 1)
+         (is (= ["Синие: 17" "Красные: 30" "Цель: 100"] (labels)))
+         (is (= "Моё дерево: 7 | Мой камень: 4" (panel-text ui)))
+         (swap! response assoc-in [:world :match :scores :red] 45)
+         (gui/refresh! map-panel {} ui 1)
+         (is (= ["Синие: 17" "Красные: 45" "Цель: 100"] (labels))))))))
+
+(deftest finished-match-notifies-once-and-keeps-map-test
+  (javax.swing.SwingUtilities/invokeAndWait
+   (fn []
+     (doseq [[winner message] [[:blue "Победила синяя команда!"]
+                              [:red "Победила красная команда!"]]]
+       (let [map-panel (gui/create-map-panel 0 0 1)
+             messages (atom [])
+             ui (assoc (gui/create-resource-panel {}) :show-victory! #(swap! messages conj %))
+             active {:players {1 {:x 0 :y 0}}
+                     :objects {}
+                     :match {:scores {:blue 98 :red 98} :phase :active}}
+             finished (-> active
+                          (assoc :objects {[1 0] :tree})
+                          (assoc-in [:match :scores winner] 100)
+                          (assoc-in [:match :phase] :finished)
+                          (assoc-in [:match :winner] winner))
+             response (atom active)]
+         (with-redefs [client/async! (fn [_ _ _ callback] (callback {:status :ok :world @response}))]
+           (gui/refresh! map-panel {} ui 1)
+           (is (empty? @messages))
+           (reset! response finished)
+           (dotimes [_ 3] (gui/refresh! map-panel {} ui 1))
+           (is (= [message] @messages))
+           (is (= (if (= :blue winner) "Синие: 100" "Красные: 100")
+                  (.getText (ui ({:blue :blue-label :red :red-label} winner)))))
+           (is (= {:players (:players finished) :objects (:objects finished)}
+                  (.getClientProperty map-panel :settlement.gui/state)))))))))
 
 (deftest personal-resource-panels-test
   (register :a 1)

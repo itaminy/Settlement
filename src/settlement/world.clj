@@ -6,6 +6,27 @@
 
 (def initial-objects layout/initial-objects)
 
+(def ^:private building-points {:fence 2 :house 15})
+(def ^:private victory-score 100)
+(def initial-match {:scores {:blue 0 :red 0} :phase :active :winner nil})
+
+(defn- recalculate-match [{:keys [objects match] :as state}]
+  (let [scores (reduce (fn [scores {:keys [team kind] :as object}]
+                         (if (and (buildings/building? object) (contains? scores team))
+                           (update scores team + (get building-points kind 0))
+                           scores))
+                       (:scores initial-match) (vals objects))
+        ;; В старом мире, где обе команды уже набрали порог, побеждает лидер.
+        leader (if (>= (:blue scores) (:red scores)) :blue :red)
+        winner (or (:winner match)
+                   (when (>= (scores leader) victory-score) leader))]
+    (assoc state :match {:scores scores :phase (if winner :finished :active) :winner winner})))
+
+(defn match-finished? [state]
+  (= :finished (get-in state [:match :phase])))
+
+(def ^:private match-finished-result {:status :error :code :match-finished})
+
 ;; Общее состояние игрового мира
 (defonce world
   (ref
@@ -15,7 +36,11 @@
 
     :players {}
 
+    :match initial-match
+
     :objects initial-objects}))
+
+(defonce gathering (ref {}))
 
 (defn migrate-inventories! []
   (dosync
@@ -46,7 +71,9 @@
                                           (assoc-in assigned [position :team] team)
                                           assigned))
                                       objects objects)]
-               (assoc state :players players :objects objects)))))
+               (recalculate-match (assoc state :players players :objects objects)))))
+    (when (match-finished? @world)
+      (ref-set gathering {})))
   nil)
 
 (migrate-teams!)
@@ -62,7 +89,7 @@
 ;; Поиск и создание выполняются в одной транзакции, включая внешнюю auth-транзакцию.
 (defn add-player [player-id name]
   (dosync
-    (when-not (contains? (:players @world) player-id)
+    (when-not (or (match-finished? @world) (contains? (:players @world) player-id))
       (when-let [[x y] (let [accessible (buildings/spawn-accessible-cells (:objects @world))]
                         (first (filter #(and (accessible %) (free-cell? @world %)) (layout/spawn-cells))))]
         (alter world assoc-in [:players player-id]
@@ -72,15 +99,17 @@
 
 (defn change-player-items! [player-id changes]
   (dosync
-    (if-let [player (get-in @world [:players player-id])]
-      (try
-        (let [player (inventory/normalize-player player)
-              updated (inventory/change-items (:inventory player) changes)]
-          (alter world assoc-in [:players player-id] (assoc player :inventory updated))
-          {:status :ok})
-        (catch clojure.lang.ExceptionInfo e
-          {:status :error :code (:code (ex-data e))}))
-      {:status :error :code :player-not-found})))
+    (if (match-finished? @world)
+      match-finished-result
+      (if-let [player (get-in @world [:players player-id])]
+        (try
+          (let [player (inventory/normalize-player player)
+                updated (inventory/change-items (:inventory player) changes)]
+            (alter world assoc-in [:players player-id] (assoc player :inventory updated))
+            {:status :ok})
+          (catch clojure.lang.ExceptionInfo e
+            {:status :error :code (:code (ex-data e))}))
+        {:status :error :code :player-not-found}))))
 
 ;; Внутреннее начисление: сетевая команда :collect по-прежнему запрещена.
 (defn collect-resource [player-id resource amount]
@@ -97,7 +126,6 @@
                            :let [player (inventory/normalize-player player)]]
                        [id (assoc player :collected (inventory/resources (:inventory player)))])))))
 
-(defonce gathering (ref {}))
 (defn now-ns [] (System/nanoTime))
 (def heartbeat-timeout-ms 1500)
 (defn cancel-player-gather! [id] (dosync (alter gathering dissoc id)) nil)
@@ -105,24 +133,34 @@
   (dosync (alter gathering #(into {} (remove (fn [[_ action]] (= connection (:connection action))) %)))) nil)
 
 (defn craft! [id tool]
-  (if-let [cost (inventory/recipes tool)]
-    (dosync (change-player-items! id (assoc (into {} (map (fn [[item n]] [item (- n)]) cost)) tool 1)))
-    {:status :error :code :unknown-recipe}))
+  (dosync
+    (if (match-finished? @world)
+      match-finished-result
+      (if-let [cost (inventory/recipes tool)]
+        (change-player-items! id (assoc (into {} (map (fn [[item n]] [item (- n)]) cost)) tool 1))
+        {:status :error :code :unknown-recipe}))))
 
 (defn check-build [player-id kind position]
-  (select-keys (buildings/validate @world player-id kind position) [:status :code :cells :cost]))
+  (let [state @world]
+    (if (match-finished? state)
+      match-finished-result
+      (select-keys (buildings/validate state player-id kind position) [:status :code :cells :cost]))))
 
 (defn build! [player-id kind position]
   (dosync
-    (let [result (buildings/validate @world player-id kind position)]
+    (let [state @world
+          result (if (match-finished? state) match-finished-result
+                     (buildings/validate state player-id kind position))]
       (if-not (= :ok (:status result))
         (select-keys result [:status :code])
         (let [payment (change-player-items! player-id
                         (into {} (map (fn [[item amount]] [item (- amount)]) (:cost result))))]
           (if-not (= :ok (:status payment)) payment
             (do
-              (alter world assoc-in [:objects position] (:entry result))
-              (alter gathering dissoc player-id)
+              (alter world #(recalculate-match (assoc-in % [:objects position] (:entry result))))
+              (if (match-finished? @world)
+                (ref-set gathering {})
+                (alter gathering dissoc player-id))
               {:status :ok :position position :building (:entry result)})))))))
 
 (defn move-player-result [player-id direction]
@@ -132,6 +170,7 @@
           delta ({:up [0 -1] :down [0 1] :left [-1 0] :right [1 0]} direction)
           fail (fn [code message] {:status :error :code code :message message})]
       (cond
+        (match-finished? state) match-finished-result
         (nil? player) (fail :player-not-found "Player not found")
         (nil? delta) (fail :invalid-direction "Unknown movement direction")
         :else
@@ -177,6 +216,7 @@
     (let [now (now-ns) existing (get @gathering id)
           player (get-in @world [:players id])]
       (cond
+        (match-finished? (ensure world)) match-finished-result
         (nil? player) {:status :error :message "Player not found"}
         (not (and (string? attempt-id) (<= 1 (count attempt-id) 128))) {:status :error :code :invalid-attempt}
         (and existing (active? id existing now))
@@ -201,18 +241,21 @@
 
 (defn cancel-gather! [id connection operation-id attempt-id]
   (dosync
-    (let [action (get @gathering id)]
-      (when (and (= connection (:connection action))
-                 (or (and operation-id (= operation-id (:operation-id action)))
-                     (and attempt-id (= attempt-id (:attempt-id action)))))
-        (alter gathering dissoc id))
-      {:status :ok :cancelled true})))
+    (if (match-finished? (ensure world))
+      match-finished-result
+      (let [action (get @gathering id)]
+        (when (and (= connection (:connection action))
+                   (or (and operation-id (= operation-id (:operation-id action)))
+                       (and attempt-id (= attempt-id (:attempt-id action)))))
+          (alter gathering dissoc id))
+        {:status :ok :cancelled true}))))
 
 (defn update-gather! [id connection operation-id finish?]
   (let [result
         (dosync
           (let [now (now-ns) action (get @gathering id)]
             (cond
+              (match-finished? (ensure world)) match-finished-result
               (not (and action (= connection (:connection action)) (= operation-id (:operation-id action))))
               {:status :error :code :no-active-gather}
               (not (active? id action now))
@@ -238,6 +281,7 @@
 (defn restore-resource [position object]
   (dosync
     (cond
+      (match-finished? @world) :match-finished
       (buildings/occupied? (:objects @world) position) :exists
       (player-at? @world position) :occupied
       :else (do (alter world assoc-in [:objects position] object) :restored))))

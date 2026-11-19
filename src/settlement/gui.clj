@@ -8,7 +8,7 @@
             [settlement.building-ui :as building-ui])
   (:import [javax.swing JFrame JDialog JPanel JLabel SwingUtilities
             AbstractAction KeyStroke Timer JOptionPane JProgressBar]
-           [java.awt Color Dimension BorderLayout FlowLayout Font GraphicsEnvironment]
+           [java.awt Color Dimension BorderLayout FlowLayout Font GraphicsEnvironment GridLayout]
            [java.awt.event ActionListener KeyEvent WindowAdapter]))
 
 (def map-size rendering/map-size)
@@ -48,34 +48,41 @@
      (update-map panel {} {})
      panel)))
 
-(declare update-resource-panel update-player-panels!)
+(declare update-player-panels!)
 
 (defn player-resources [state player-id]
   (inventory/resources (inventory/player-inventory (get-in state [:players player-id]))))
+
+(defn- apply-world! [panel resource-ui state player-id]
+  (update-map panel (:players state) (:objects state))
+  (when resource-ui
+    (update-player-panels! resource-ui state player-id)))
 
 (defn refresh! [panel connection resource-ui player-id]
   (client/async! connection :state {:type :state}
     (fn [response]
       (when (= :ok (:status response))
-        (update-map panel (get-in response [:world :players]) (get-in response [:world :objects]))
-        (update-player-panels! resource-ui (:world response) player-id)))))
+        (apply-world! panel resource-ui (:world response) player-id)))))
 
 (defn cancel-local-gather! [panel]
   (when-let [controller (.getClientProperty panel ::gather-controller)]
     ((:release! controller))))
 
-(defn bind-key [panel connection player-id key-code direction]
-  (let [key-name (str "move-" (name direction))]
-    (.put (.getInputMap panel JPanel/WHEN_IN_FOCUSED_WINDOW) (KeyStroke/getKeyStroke key-code 0) key-name)
-    (.put (.getActionMap panel) key-name
-      (proxy [AbstractAction] []
-        (actionPerformed [_]
-          (cancel-local-gather! panel)
-          (client/async! connection [:move direction]
-            {:type :move :player-id player-id :direction direction}
-            (fn [response]
-              (when (= :ok (:status response))
-                (update-map panel (get-in response [:world :players]) (get-in response [:world :objects]))))))))))
+(defn bind-key
+  ([panel connection player-id key-code direction]
+   (bind-key panel connection player-id key-code direction nil))
+  ([panel connection player-id key-code direction resource-ui]
+   (let [key-name (str "move-" (name direction))]
+     (.put (.getInputMap panel JPanel/WHEN_IN_FOCUSED_WINDOW) (KeyStroke/getKeyStroke key-code 0) key-name)
+     (.put (.getActionMap panel) key-name
+       (proxy [AbstractAction] []
+         (actionPerformed [_]
+           (cancel-local-gather! panel)
+           (client/async! connection [:move direction]
+             {:type :move :player-id player-id :direction direction}
+             (fn [response]
+               (when (= :ok (:status response))
+                 (apply-world! panel resource-ui (:world response) player-id))))))))))
 
 (defn bind-gather-key [panel connection resource-ui player-id]
   (let [progress (or (:progress-bar resource-ui) (JProgressBar. 0 100))
@@ -95,25 +102,29 @@
                            (actionPerformed [_] (refresh! panel connection resource-ui player-id))))]
     (.start timer) timer))
 
-;; Создание панели ресурсов
 (defn create-resource-panel [resources]
-  (let [panel (JPanel. (FlowLayout. FlowLayout/LEFT 20 10))
-        separator (JLabel. "|")
-        wood-label (JLabel.
-                    (str "Моё дерево: " (:wood resources 0)))
-        stone-label (JLabel.
-                     (str "Мой камень: " (:stone resources 0)))]
-
-    (.setBackground panel (Color. 65 85 55))
-
-    (doseq [label [wood-label separator stone-label]]
-      (.setForeground label Color/WHITE)
-      (.setFont label (Font. "Arial" Font/BOLD 16))
-      (.add panel label))
+  (let [panel (JPanel. (GridLayout. 2 1))
+        blue-label (JLabel. "Синие: 0")
+        red-label (JLabel. "Красные: 0")
+        goal-label (JLabel. "Цель: 100")
+        wood-label (JLabel. (str "Моё дерево: " (:wood resources 0)))
+        stone-label (JLabel. (str "Мой камень: " (:stone resources 0)))]
+    (doseq [labels [[blue-label red-label goal-label] [wood-label (JLabel. "|") stone-label]]]
+      (let [row (JPanel. (FlowLayout. FlowLayout/LEFT 12 5))]
+        (.setBackground row (Color. 65 85 55))
+        (doseq [label labels]
+          (.setForeground label Color/WHITE)
+          (.setFont label (Font. "Arial" Font/BOLD 16))
+          (.add row label))
+        (.add panel row)))
 
     {:panel panel
+     :blue-label blue-label
+     :red-label red-label
+     :goal-label goal-label
      :wood-label wood-label
-     :stone-label stone-label}))
+     :stone-label stone-label
+     :victory-shown? (atom false)}))
 
 
 ;; Обновление количества ресурсов
@@ -125,10 +136,19 @@
             (str "Мой камень: " (:stone resources 0))))
 
 (defn update-player-panels! [resource-ui state player-id]
-  (let [contents (inventory/player-inventory (get-in state [:players player-id]))]
+  (let [contents (inventory/player-inventory (get-in state [:players player-id]))
+        {:keys [scores phase winner]} (:match state)]
     (update-resource-panel resource-ui (inventory/resources contents))
+    (.setText (:blue-label resource-ui) (str "Синие: " (:blue scores 0)))
+    (.setText (:red-label resource-ui) (str "Красные: " (:red scores 0)))
     (when-let [ui (:inventory-ui resource-ui)]
-      (inventory-ui/update-panel! ui contents))))
+      (inventory-ui/update-panel! ui contents))
+    (when-let [notify! (:show-victory! resource-ui)]
+      (when-let [message (when (= :finished phase)
+                          ({:blue "Победила синяя команда!"
+                            :red "Победила красная команда!"} winner))]
+        (when (compare-and-set! (:victory-shown? resource-ui) false true)
+          (notify! message))))))
 
 (defn bind-inventory-key [component toggle!]
   (.put (.getInputMap component JPanel/WHEN_IN_FOCUSED_WINDOW)
@@ -140,6 +160,13 @@
 (defn- confirm-dialog [message]
   (= JOptionPane/YES_OPTION
      (JOptionPane/showConfirmDialog nil message "Settlement" JOptionPane/YES_NO_OPTION)))
+
+(defn- show-victory! [frame message]
+  (let [dialog (.createDialog (JOptionPane. message JOptionPane/INFORMATION_MESSAGE)
+                              frame "Матч завершён")]
+    (.setModal dialog false)
+    (.setDefaultCloseOperation dialog JDialog/DISPOSE_ON_CLOSE)
+    (.setVisible dialog true)))
 
 (defn- authorization-message [code]
   (case code
@@ -177,19 +204,19 @@
         progress (doto (JProgressBar. 0 100) (.setStringPainted true) (.setString "Добыча: удерживайте E")
                        (.setForeground (Color. 132 164 83)) (.setBackground (Color. 45 59 39)) (.setVisible false))
         resource-ui (assoc (create-resource-panel (player-resources (:world response) player-id))
-                           :inventory-ui inventory-panel :progress-bar progress)
+                           :inventory-ui inventory-panel :progress-bar progress
+                           :show-victory! #(show-victory! frame %))
         inventory-window (JDialog. frame "Инвентарь" false)
         build-label (doto (JLabel. "B — строительство") (.setForeground (Color. 240 230 193))
                           (.setPreferredSize (Dimension. 600 40)))
         footer (doto (JPanel. (BorderLayout.)) (.setBackground (Color. 45 59 39)))
         builder (building-ui/install! map-panel connection player-id build-label
-                  (fn [state] (update-map map-panel (:players state) (:objects state))
-                              (update-player-panels! resource-ui state player-id))
+                  #(apply-world! map-panel resource-ui % player-id)
                   #(cancel-local-gather! map-panel))
         timer (start-map-updater map-panel connection resource-ui player-id)]
     (doseq [[key direction] [[KeyEvent/VK_UP :up] [KeyEvent/VK_DOWN :down]
                              [KeyEvent/VK_LEFT :left] [KeyEvent/VK_RIGHT :right]]]
-      (bind-key map-panel connection player-id key direction))
+      (bind-key map-panel connection player-id key direction resource-ui))
     (bind-craft-buttons! connection player-id resource-ui)
     (.setContentPane inventory-window (:panel inventory-panel))
     (.setDefaultCloseOperation inventory-window JDialog/HIDE_ON_CLOSE)
@@ -205,7 +232,6 @@
       (bind-inventory-key map-panel toggle!)
       (bind-inventory-key (.getRootPane inventory-window) toggle!))
     (bind-gather-key map-panel connection resource-ui player-id)
-    (update-map map-panel (get-in response [:world :players]) (get-in response [:world :objects]))
     (.addWindowFocusListener frame
       (proxy [java.awt.event.WindowFocusListener] []
         (windowGainedFocus [_] nil)
@@ -227,12 +253,19 @@
     (.add footer build-label BorderLayout/SOUTH)
     (.add (.getContentPane frame) footer BorderLayout/SOUTH)
     (.pack frame)
+    (.setMinimumSize frame
+      (let [insets (.getInsets frame)
+            size (.getPreferredSize (:panel resource-ui))]
+        (Dimension. (+ (max 400 (.width size)) (.left insets) (.right insets))
+                    (+ (.height size) (.top insets) (.bottom insets)
+                       (.height (.getPreferredSize footer)) 1))))
     (let [bounds (.getMaximumWindowBounds (GraphicsEnvironment/getLocalGraphicsEnvironment))]
       (.setSize frame (min (.getWidth frame) (.width bounds))
                       (min (.getHeight frame) (.height bounds))))
     (.setLocationRelativeTo frame nil)
     (.setVisible frame true)
-    (.requestFocusInWindow map-panel)))
+    (.requestFocusInWindow map-panel)
+    (apply-world! map-panel resource-ui (:world response) player-id)))
 
 (defn- on-edt [f]
   (if (SwingUtilities/isEventDispatchThread) (f)

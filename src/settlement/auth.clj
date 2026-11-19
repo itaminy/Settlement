@@ -27,7 +27,8 @@
     (dosync
       (cond
         (owner connection) (failure :already-authenticated)
-        (contains? (:players (world/get-world)) id) (failure :player-exists)
+        (contains? (:players @world/world) id) (failure :player-exists)
+        (world/match-finished? @world/world) (failure :match-finished)
         (not (world/add-player id name)) (failure :map-full)
         :else
         (let [secret (token)]

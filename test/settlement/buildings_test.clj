@@ -18,7 +18,8 @@
 
 (use-fixtures :each
   (fn [f]
-    (with-redefs [world/world (ref {:players {} :objects {} :resources {:wood 0 :stone 0}})
+    (with-redefs [world/world (ref {:players {} :objects {} :resources {:wood 0 :stone 0}
+                                   :match world/initial-match})
                   world/gathering (ref {}) auth/state (ref (auth/new-state))
                   layout/spawn-position [0 0] layout/spawn-cells support/row-major-spawn
                   buildings/protected-cells #{[0 0]}]
@@ -42,7 +43,9 @@
 (deftest fence-and-house-costs-test
   (player! 1 [10 10] {:wood 30 :stone 20})
   (is (= :ok (:status (build! 1 :fence [10 11]))))
+  (is (= {:blue 2 :red 0} (get-in (world/get-world) [:match :scores])))
   (is (= :ok (:status (build! 1 :house [11 10]))))
+  (is (= {:scores {:blue 17 :red 0} :phase :active :winner nil} (:match (world/get-world))))
   (is (= {:wood 13 :stone 10 :axe 0 :pickaxe 0} (items 1)))
   (let [objects (:objects (world/get-world))]
     (is (= 2 (count objects)))
@@ -122,6 +125,75 @@
   (player! 1 [10 10] {:wood 15 :stone 10}) (player! 2 [14 10] {:wood 15 :stone 10})
   (is (= {:ok 1 :error 1} (frequencies (map :status (race [#(build! 1 :house [11 10]) #(build! 2 :house [12 10])])))))
   (is (= 4 (count (buildings/occupied-cells (:objects (world/get-world)))))))
+
+(defn- put-legacy-fences! [teams]
+  (dosync
+    (alter world/world update :objects into
+           (map-indexed (fn [index team]
+                          [[(+ 1 (mod index 25)) (+ 20 (* 3 (quot index 25)))]
+                           {:type :building :kind :fence :team team}])
+                        teams)))
+  (world/migrate-teams!))
+
+(deftest concurrent-winning-builds-test
+  (player! 1 [10 10] {:wood 2})
+  (player! 2 [15 10] {:wood 2})
+  (put-legacy-fences! (concat (repeat 49 :blue) (repeat 49 :red)))
+  (is (= {:scores {:blue 98 :red 98} :phase :active :winner nil} (:match (world/get-world))))
+  (let [results (race [#(build! 1 :fence [11 10]) #(build! 2 :fence [16 10])])
+        winner (if (= :ok (:status (first results))) :blue :red)
+        loser ({:blue :red :red :blue} winner)
+        state (world/get-world)]
+    (is (= {:ok 1 :error 1} (frequencies (map :status results))))
+    (is (= :match-finished (:code (first (filter :code results)))))
+    (is (= {:scores {winner 100 loser 98} :phase :finished :winner winner} (:match state)))
+    (is (= (:match state) (get-in (first (filter :building results)) [:world :match])))
+    (is (= 99 (count (:objects state))))
+    (is (= [0 2] (sort [(:wood (items 1)) (:wood (items 2))])))))
+
+(deftest match-migration-recalculates-without-duplicating-points-test
+  (dosync (alter world/world dissoc :match))
+  (dosync (alter world/world assoc-in [:objects [12 11]] :house)
+          (alter world/world assoc-in [:objects [14 12]] {:type :building :kind :house :owner-id 99})
+          (alter world/world assoc-in [:objects [16 12]] {:type :building :kind :house :team :red}))
+  (put-legacy-fences! (concat (repeat 50 :blue) (repeat 50 :red)))
+  (let [state (world/get-world)]
+    (is (= {:scores {:blue 100 :red 115} :phase :finished :winner :red} (:match state)))
+    (world/migrate-teams!)
+    (is (= state (world/get-world)))
+    ;; Emulate removing one building to verify that the score can be rebuilt.
+    (dosync (alter world/world update :objects dissoc [16 12] [1 20] [1 26] [2 26]))
+    (world/migrate-teams!)
+    (is (= {:scores {:blue 98 :red 96} :phase :finished :winner :red} (:match (world/get-world))))))
+
+(deftest completed-match-blocks-gameplay-test
+  (player! 1 [10 10] {:wood 20 :stone 10})
+  (let [registration (server/process-message 2 {:type :register :player-id 2 :name "Red"})]
+    (dosync (alter world/world update-in [:players 2] assoc :x 15 :y 10)
+            (alter world/world assoc-in [:objects [15 9]] :tree))
+    (put-legacy-fences! (repeat 49 :blue))
+    (let [start (server/process-message 2 {:type :gather-start :player-id 2 :attempt-id "active"})
+          operation-id (:operation-id start)]
+      (is (= :ok (:status start)))
+      (is (= :ok (:status (build! 1 :fence [11 10]))))
+      (is (empty? @world/gathering))
+      (let [state (world/get-world)]
+        (doseq [command [{:type :move :direction :down}
+                         {:type :craft :tool :axe}
+                         {:type :build :building-type :fence :position [10 11]}
+                         {:type :build-check :building-type :fence :position [10 11]}
+                         {:type :gather-start :attempt-id "new"}]]
+          (is (= :match-finished (:code (server/process-message 1 (assoc command :player-id 1))))))
+        (doseq [type [:gather-heartbeat :gather-finish :gather-cancel]]
+          (is (= :match-finished (:code (server/process-message 2 {:type type :player-id 2
+                                                                  :operation-id operation-id})))))
+        (is (= :match-finished (:code (server/process-message 3 {:type :register :player-id 3 :name "Late"}))))
+        (is (= :match-finished (world/restore-resource [8 8] :tree)))
+        (auth/disconnect! 2)
+        (is (= :ok (:status (server/process-message :reconnected
+                              (merge (select-keys registration [:token :server-instance])
+                                     {:type :login :player-id 2})))))
+        (is (= {:status :ok :world state} (server/process-message {:type :state})))))))
 
 (deftest simultaneous-payments-cannot-overdraw-test
   (player! 1 [10 10] {:wood 2})
@@ -273,6 +345,7 @@
           (is (= :ok (:status (client/request a {:type :build :player-id 1 :building-type :fence :position [11 10]}))))
           (let [state (:world (client/request b {:type :state}))]
             (is (= state (:world (client/request a {:type :state}))))
+            (is (= {:blue 2 :red 0} (get-in state [:match :scores])))
             (is (= [:blue :red] (mapv #(get-in state [:players % :team]) [1 2])))
             (is (= {:type :building :kind :fence :owner-id 1 :team :blue}
                    (get-in state [:objects [11 10]]))))

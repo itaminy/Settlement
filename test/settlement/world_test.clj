@@ -20,6 +20,7 @@
 (def ^:private initial-world
   {:resources {:wood 0 :stone 0}
    :players {}
+   :match world/initial-match
    :objects {[3 4] :tree [7 2] :stone [8 6] :house [5 5] :tree}})
 
 (def ^:private real-schedule-restore world/schedule-resource-restore)
@@ -95,6 +96,7 @@
              (update-vals (:players migrated) #(dissoc % :team))))
       (is (= (assoc-in objects [[10 10] :team] :red) (:objects migrated)))
       (is (= (:resources initial-world) (:resources migrated)))
+      (is (= {:scores {:blue 2 :red 2} :phase :active :winner nil} (:match migrated)))
       (world/migrate-teams!)
       (is (= migrated @world/world)))))
 
