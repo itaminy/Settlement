@@ -7,6 +7,8 @@
             [settlement.auth :as auth]
             [settlement.world :as world]
             [settlement.config :as config]
+            [settlement.framing :as framing]
+            [settlement.protocol :as protocol]
             [settlement.server :as server]
             [settlement.client :as client]
             [settlement.gui :as gui]
@@ -402,3 +404,74 @@
             (is (= :ok (:status (login :reconnected 1 registration))))
             (is (= before (world/get-world)))))
         (finally (.close socket) (future-cancel handler))))))
+
+(deftest text-and-edn-sessions-share-world-test
+  (with-open [listener (ServerSocket. 0)]
+    (let [port (.getLocalPort listener)]
+      (with-open [text-socket (doto (Socket. "127.0.0.1" port) (.setSoTimeout 5000))
+                  edn-socket (doto (Socket. "127.0.0.1" port) (.setSoTimeout 5000))]
+        (let [handlers (mapv (fn [_] (let [socket (.accept listener)]
+                                      (future (server/handle-client socket)))) (range 2))
+              stream (fn [socket]
+                       {:reader (io/reader (.getInputStream socket) :encoding "UTF-8")
+                        :writer (io/writer (.getOutputStream socket) :encoding "UTF-8")})
+              text (stream text-socket)
+              edn (stream edn-socket)
+              line! (fn [line]
+                      (.write (:writer text) (str line "\r\n"))
+                      (.flush (:writer text))
+                      (.readLine (:reader text)))
+              handshake! (comp protocol/read-message line!)]
+          (try
+            (is (= :not-authenticated (:code (handshake! "текст 1"))))
+            (is (= :not-authenticated (:code (client/request text {:type :inventory}))))
+            (let [registration (client/request text {:type :register :player-id 1 :name "Анна"})
+                  other (client/request edn {:type :register :player-id 2 :name "Борис"})]
+            (is (= :ok (:status registration) (:status other)))
+            (is (= :unsupported-version (:code (handshake! "текст 2"))))
+            (is (= :ok (:status (client/request text {:type :hello}))))
+            (is (= {:status :ok :mode :text :version 1} (handshake! "текст 1")))
+            (world/change-player-items! 1 {:wood 2})
+            (world/change-player-items! 2 {:stone 3})
+            (is (= "reply v=1 ok inventory wood=2 stone=0 axe=0 pickaxe=0"
+                   (line! "покажи инвентарь")))
+            (is (= :wrong-player (:code (client/request edn {:type :inventory :player-id 1}))))
+            (is (= 3 (get-in (client/request edn {:type :inventory}) [:inventory :items :stone])))
+            (is (= "reply v=1 error code=invalid-argument" (line! "иди вниз :player-id 2")))
+            (is (= "reply v=1 error code=unknown-command" (line! "{:type :hello}")))
+            (is (= "reply v=1 ok move x=0 y=1" (line! "иди вниз")))
+            (is (= {1 [0 1] 2 [2 0]}
+                   (into {} (map (fn [[id player]] [id ((juxt :x :y) player)]))
+                         (get-in (client/request edn {:type :state}) [:world :players]))))
+            (let [snapshot (line! "покажи мир")]
+              (is (str/includes? snapshot "players=[player(1,0,1,blue,\"Анна\"),player(2,2,0,red,\"Борис\")]"))
+              (is (str/ends-with? snapshot "attack_seq=0 repair_seq=0"))
+              (doseq [secret [(:token registration) (:token other) (:server-instance registration)]]
+                (is (not (str/includes? snapshot secret)))))
+            (let [attempt "01234567-89ab-cdef-0123-456789abcdef"]
+              (is (= "reply v=1 ok move x=0 y=0" (line! "иди вверх")))
+              (let [start (line! (str "собери дерево на 1 0 попытка " attempt))
+                    [_ operation-id] (re-find #"operation_id=([0-9a-f-]{36})" start)]
+                (is (= (str "reply v=1 ok gather-start operation_id=" operation-id
+                            " attempt_id=" attempt " duration_ms=3000 elapsed_ms=0") start))
+                (is (str/starts-with? (line! (str "заверши добычу " operation-id))
+                                      "reply v=1 error code=too-early operation_id="))))
+            (let [long-name (apply str (repeat 4500 "я"))]
+              (dosync (alter world/world assoc-in [:players 2 :name] long-name))
+              (let [snapshot (line! "покажи мир")]
+                (is (< framing/max-request-bytes (alength (.getBytes snapshot "UTF-8"))))
+                (is (str/includes? snapshot long-name))
+                (is (str/ends-with? snapshot "attack_seq=0 repair_seq=0"))))
+            (is (= "reply v=1 error code=missing-argument" (line! "построй дом"))))
+            (.write (:writer text) (apply str (repeat (inc framing/max-request-bytes) "x")))
+            (.flush (:writer text))
+            (is (nil? (.readLine (:reader text))))
+            (is (not= ::timeout (deref (first handlers) 5000 ::timeout)))
+            (is (nil? (get @world/gathering 1)))
+            (is (= :ok (:status (client/request edn {:type :hello}))))
+            (finally
+              (.close text-socket)
+              (.close edn-socket)
+              (doseq [handler handlers]
+                (deref handler 5000 nil)
+                (future-cancel handler)))))))))

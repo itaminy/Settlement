@@ -14,7 +14,10 @@
             [settlement.mechanics-test]
             [settlement.transport-test]
             [settlement.layout-test]
-            [settlement.buildings-test]))
+            [settlement.buildings-test]
+            [settlement.text-commands-test]
+            [settlement.text-protocol-test]
+            [settlement.events-test]))
 
 ;; Запуск: clojure -M -m settlement.world-test fast (или slow, all).
 (def ^:private initial-world
@@ -454,7 +457,8 @@
       (throw (ex-info "Expected fast, slow or all" {:suite suite})))
     (try
       (let [tests (->> ["settlement.world-test" "settlement.auth-test" "settlement.rendering-test" "settlement.inventory-test"
-                       "settlement.mechanics-test" "settlement.transport-test" "settlement.layout-test" "settlement.buildings-test"]
+                       "settlement.mechanics-test" "settlement.transport-test" "settlement.layout-test" "settlement.buildings-test"
+                       "settlement.text-commands-test" "settlement.text-protocol-test" "settlement.events-test"]
                        (mapcat #(vals (ns-interns (symbol %))))
                        (filter #(-> % meta :test))
                        (filter #(case suite

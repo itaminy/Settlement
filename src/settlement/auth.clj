@@ -1,5 +1,6 @@
 (ns settlement.auth
-  (:require [settlement.world :as world])
+  (:require [settlement.world :as world]
+            [settlement.event-log :as events])
   (:import [java.security SecureRandom MessageDigest]
            [java.util Base64 UUID]))
 
@@ -34,6 +35,7 @@
         (let [secret (token)]
           (alter state assoc-in [:credentials id] (digest secret))
           (alter state assoc-in [:sessions id] connection)
+          (events/append! [:player-connected])
           {:status :ok :token secret :server-instance (:instance @state)})))))
 
 (defn login! [connection id secret instance]
@@ -46,10 +48,13 @@
                 (MessageDigest/isEqual (get-in @state [:credentials id]) (digest secret))))
       (failure :invalid-credentials)
       (contains? (:sessions @state) id) (failure :already-connected)
-      :else (do (alter state assoc-in [:sessions id] connection) {:status :ok}))))
+      :else (do (alter state assoc-in [:sessions id] connection)
+                (events/append! [:player-connected])
+                {:status :ok}))))
 
 (defn disconnect! [connection]
   (dosync
     (world/cancel-connection-gathers! connection)
-    (alter state update :sessions
-           (fn [sessions] (into {} (remove #(= connection (val %)) sessions))))))
+    (when-let [id (owner connection)]
+      (alter state update :sessions dissoc id)
+      (events/append! [:player-disconnected]))))

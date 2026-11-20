@@ -19,6 +19,41 @@
   (server/process-message id {:type :register :player-id id :name (str id)}))
 (defn- start! [id]
   (server/process-message id {:type :gather-start :player-id id :attempt-id (str (java.util.UUID/randomUUID))}))
+
+(deftest explicit-gather-target-test
+  (is (= :ok (:status (register! 1))))
+  (dosync (alter world/world update :objects assoc [0 1] :stone))
+  (let [request {:type :gather-start :player-id 1 :attempt-id "test-attempt"}
+        start (fn [target] (server/process-message 1 (merge request target)))
+        operation-id (:operation-id (start {}))]
+    (is (some? operation-id))
+    (is (= [1 0] (get-in @world/gathering [1 :position])))
+    (world/cancel-gather! 1 1 operation-id nil)
+    (doseq [[target code] [[{:resource-type :wood} :invalid-resource-type]
+                           [{:position [0 -1]} :invalid-position]
+                           [{:position nil} :invalid-position]
+                           [{:position [3 0]} :no-matching-resource]
+                           [{:position [1 0] :resource-type :stone} :no-matching-resource]
+                           [{:position [0 0]} :no-matching-resource]]]
+      (is (= code (:code (start target))))
+      (is (empty? @world/gathering)))
+    (let [by-position (start {:position [0 1]})]
+      (is (= 4000 (:duration-ms by-position)))
+      (is (= [0 1] (get-in @world/gathering [1 :position])))
+      (world/cancel-gather! 1 1 (:operation-id by-position) nil))
+    (let [by-type (start {:resource-type :stone})]
+      (is (= 4000 (:duration-ms by-type)))
+      (is (= [0 1] (get-in @world/gathering [1 :position])))
+      (is (= by-type (start {:resource-type :stone})))
+      (is (= :gather-attempt-conflict (:code (start {:resource-type :tree}))))
+      (is (= :too-early (:code (world/update-gather! 1 1 (:operation-id by-type) true))))
+      (dotimes [_ 4]
+        (support/advance! 1000)
+        (world/update-gather! 1 1 (:operation-id by-type) false))
+      (is (= :stone (:resource (world/update-gather! 1 1 (:operation-id by-type) true))))
+      (is (= :tree (get-in @world/world [:objects [1 0]])))
+      (is (nil? (get-in @world/world [:objects [0 1]])))
+      (is (= 1 (get-in @world/world [:players 1 :inventory :items :stone]))))))
 (defn- command! [id action type]
   (server/process-message id {:type type :player-id id :operation-id (:operation-id action)}))
 (defn- hold! [actions ms]
