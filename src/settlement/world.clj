@@ -78,6 +78,13 @@
 
 (migrate-teams!)
 
+(defn migrate-building-durability! []
+  (dosync
+    (alter world update :objects update-vals buildings/initialize-durability))
+  nil)
+
+(migrate-building-durability!)
+
 (defn player-at? [state position]
   (boolean (some #(= position [(:x %) (:y %)]) (vals (:players state)))))
 
@@ -120,13 +127,121 @@
       true)))
 
 (defn get-world []
-  (update @world :players
+  (update (dissoc @world :building-attacks :building-repairs) :players
           (fn [players]
             (into {} (for [[id player] players
                            :let [player (inventory/normalize-player player)]]
                        [id (assoc player :collected (inventory/resources (:inventory player)))])))))
 
+(defn building-command-sequences [player-id]
+  (let [state @world]
+    {:attack-seq (get-in state [:building-attacks player-id :seq] 0)
+     :repair-seq (get-in state [:building-repairs player-id :seq] 0)}))
+
 (defn now-ns [] (System/nanoTime))
+(def ^:private attack-damage 10)
+(def ^:private attack-interval-ns 1000000000)
+
+(defn- valid-building-command? [position building-id command-seq]
+  (and (integer? command-seq) (<= 1 command-seq Long/MAX_VALUE)
+       (uuid? building-id) (buildings/cell-coordinate? position) (config/in-bounds? position)))
+
+(defn- apply-building-attack! [state player-id position building-id now last-hit]
+  (let [player (get-in state [:players player-id])
+        {:keys [anchor building] :as target} (buildings/target-at (:objects state) position)
+        team (:team player)
+        target-team (:team building)
+        fail (fn [code] {:status :error :code code})]
+    (cond
+      (nil? player) (fail :player-not-found)
+      (nil? target) (fail :building-not-found)
+      (not= building-id (:building-id building)) (fail :stale-building)
+      (not (and (#{:blue :red} team) (#{:blue :red} target-team) (not= team target-team)))
+      (fail :invalid-target-team)
+      (not (buildings/adjacent-to-building? player target)) (fail :too-far)
+      (and last-hit (< (unchecked-subtract (long now) (long last-hit)) attack-interval-ns))
+      (fail :attack-cooldown)
+      :else
+      (let [hp (max 0 (- (:hp building) attack-damage))
+            destroyed? (zero? hp)]
+        (if destroyed?
+          (alter world #(recalculate-match (update % :objects dissoc anchor)))
+          (alter world assoc-in [:objects anchor :hp] hp))
+        {:status :ok :anchor anchor :building-id building-id :hp hp :destroyed? destroyed?}))))
+
+(defn attack-building! [player-id position building-id attack-seq]
+  (dosync
+    ;; Последний обработанный номер и кулдаун принадлежат игроку и переживают смену сессии.
+    (let [state @world
+          previous (get-in state [:building-attacks player-id])
+          last-seq (:seq previous 0)
+          target [position building-id]]
+      (cond
+        (match-finished? state) match-finished-result
+        (not (valid-building-command? position building-id attack-seq))
+        {:status :error :code :invalid-attack}
+        (< attack-seq last-seq)
+        {:status :error :code :stale-attack :last-attack-seq last-seq}
+        (= attack-seq last-seq)
+        (if (= target (:target previous))
+          (:result previous)
+          {:status :error :code :attack-seq-conflict :last-attack-seq last-seq})
+        :else
+        (let [now (now-ns)
+              last-hit (:last-hit previous)
+              result (apply-building-attack! state player-id position building-id now last-hit)]
+          (alter world assoc-in [:building-attacks player-id]
+                 {:seq attack-seq :target target :result result
+                  :last-hit (if (= :ok (:status result)) now last-hit)})
+          result)))))
+
+(def ^:private repair-hp 10)
+(def ^:private repair-payment {:wood -1})
+
+(defn- apply-building-repair! [state player-id position building-id]
+  (let [player (get-in state [:players player-id])
+        {:keys [anchor building] :as target} (buildings/target-at (:objects state) position)
+        team (:team player)
+        {:keys [hp max-hp]} building
+        fail (fn [code] {:status :error :code code})]
+    (cond
+      (nil? player) (fail :player-not-found)
+      (nil? target) (fail :building-not-found)
+      (not= building-id (:building-id building)) (fail :stale-building)
+      (not (and (#{:blue :red} team) (= team (:team building)))) (fail :invalid-target-team)
+      (not (buildings/adjacent-to-building? player target)) (fail :too-far)
+      (>= hp max-hp) (fail :building-at-full-hp)
+      :else
+      (let [payment (change-player-items! player-id repair-payment)]
+        (if (= :ok (:status payment))
+          (let [restored (min repair-hp (- max-hp hp))
+                new-hp (+ hp restored)]
+            (alter world assoc-in [:objects anchor :hp] new-hp)
+            {:status :ok :anchor anchor :building-id building-id :hp new-hp :restored-hp restored})
+          payment)))))
+
+(defn repair-building! [player-id position building-id repair-seq]
+  (dosync
+    (let [state @world
+          previous (get-in state [:building-repairs player-id])
+          last-seq (:seq previous 0)
+          target [position building-id]]
+      (cond
+        (match-finished? state) match-finished-result
+        (not (valid-building-command? position building-id repair-seq))
+        {:status :error :code :invalid-repair}
+        (< repair-seq last-seq)
+        {:status :error :code :stale-repair :last-repair-seq last-seq}
+        (= repair-seq last-seq)
+        (if (= target (:target previous))
+          (:result previous)
+          {:status :error :code :repair-seq-conflict :last-repair-seq last-seq})
+        :else
+        (let [result (apply-building-repair! state player-id position building-id)]
+          (alter world assoc-in [:building-repairs player-id]
+                 {:seq repair-seq :target target :result result})
+          result)))))
+
 (def heartbeat-timeout-ms 1500)
 (defn cancel-player-gather! [id] (dosync (alter gathering dissoc id)) nil)
 (defn cancel-connection-gathers! [connection]
@@ -156,12 +271,12 @@
         (let [payment (change-player-items! player-id
                         (into {} (map (fn [[item amount]] [item (- amount)]) (:cost result))))]
           (if-not (= :ok (:status payment)) payment
-            (do
-              (alter world #(recalculate-match (assoc-in % [:objects position] (:entry result))))
+            (let [building (buildings/initialize-durability (:entry result))]
+              (alter world #(recalculate-match (assoc-in % [:objects position] building)))
               (if (match-finished? @world)
                 (ref-set gathering {})
                 (alter gathering dissoc player-id))
-              {:status :ok :position position :building (:entry result)})))))))
+              {:status :ok :position position :building building})))))))
 
 (defn move-player-result [player-id direction]
   (dosync

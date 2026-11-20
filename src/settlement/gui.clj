@@ -207,12 +207,13 @@
                            :inventory-ui inventory-panel :progress-bar progress
                            :show-victory! #(show-victory! frame %))
         inventory-window (JDialog. frame "Инвентарь" false)
-        build-label (doto (JLabel. "B — строительство") (.setForeground (Color. 240 230 193))
+        build-label (doto (JLabel. building-ui/controls-text) (.setForeground (Color. 240 230 193))
                           (.setPreferredSize (Dimension. 600 40)))
         footer (doto (JPanel. (BorderLayout.)) (.setBackground (Color. 45 59 39)))
         builder (building-ui/install! map-panel connection player-id build-label
                   #(apply-world! map-panel resource-ui % player-id)
-                  #(cancel-local-gather! map-panel))
+                  #(cancel-local-gather! map-panel)
+                  (:building-sequences response))
         timer (start-map-updater map-panel connection resource-ui player-id)]
     (doseq [[key direction] [[KeyEvent/VK_UP :up] [KeyEvent/VK_DOWN :down]
                              [KeyEvent/VK_LEFT :left] [KeyEvent/VK_RIGHT :right]]]
@@ -283,7 +284,7 @@
                         #(on-edt (fn [] (confirm-dialog "Сервер перезапущен. Создать нового персонажа? Прежний мир утрачен.")))
                         #(on-edt (fn [] (confirm-dialog "Не удалось сохранить данные входа. Повторить сохранение?"))))]
             (if (= :ok (:status result))
-              (let [response (client/request connection {:type :state})]
+              (let [response (client/request connection {:type :state :include-building-sequences true})]
                 (SwingUtilities/invokeLater #(open-game-window connection player-id response)))
               (do (client/close-connection connection)
                   (on-edt #(JOptionPane/showMessageDialog nil (authorization-message (:code result)))))))

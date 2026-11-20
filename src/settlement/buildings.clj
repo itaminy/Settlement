@@ -4,13 +4,42 @@
             [settlement.inventory :as inventory]))
 
 (def catalog
-  {:fence {:name "Деревянный забор" :size [1 1] :cost {:wood 2}}
-   :house {:name "Деревянный дом" :size [2 2] :cost {:wood 15 :stone 10}}})
+  {:fence {:name "Деревянный забор" :size [1 1] :cost {:wood 2} :max-hp 50}
+   :house {:name "Деревянный дом" :size [2 2] :cost {:wood 15 :stone 10} :max-hp 200}})
 
 (defn building? [object] (and (map? object) (= :building (:type object))))
+
+(defn initialize-durability [object]
+  (if-let [max-hp (and (building? object) (get-in catalog [(:kind object) :max-hp]))]
+    (let [max-hp (or (:max-hp object) max-hp)]
+      (cond-> object
+        (nil? (:building-id object)) (assoc :building-id (random-uuid))
+        (nil? (:hp object)) (assoc :hp max-hp)
+        (nil? (:max-hp object)) (assoc :max-hp max-hp)))
+    object))
+
 (defn cells [[x y] object]
   (let [[width height] (if (building? object) (get-in catalog [(:kind object) :size]) [1 1])]
     (for [dy (range height) dx (range width)] [(+ x dx) (+ y dy)])))
+
+(defn cell-coordinate? [position]
+  (and (vector? position) (= 2 (count position)) (every? integer? position)))
+
+(defn target-at [objects position]
+  (when (and (cell-coordinate? position) (config/in-bounds? position))
+    (let [[target other] (for [[anchor object] objects
+                               :when (and (building? object) (some #{position} (cells anchor object)))]
+                           {:anchor anchor :building object})]
+      (when-not other target))))
+
+(defn- distance-to-cells [{:keys [x y]} footprint]
+  (reduce min (map (fn [[cx cy]] (+ (abs (- cx x)) (abs (- cy y)))) footprint)))
+
+(defn distance-to-building [player {:keys [anchor building]}]
+  (distance-to-cells player (cells anchor building)))
+
+(defn adjacent-to-building? [player target]
+  (= 1 (distance-to-building player target)))
 
 (defn occupied-cells [objects]
   (into #{} (mapcat (fn [[position object]] (cells position object)) objects)))
@@ -57,7 +86,7 @@
     (cond
       (nil? player) (fail :player-not-found)
       (nil? spec) (fail :unknown-building)
-      (not (and (vector? position) (= 2 (count position)) (every? integer? position))) (fail :invalid-position)
+      (not (cell-coordinate? position)) (fail :invalid-position)
       (not (config/in-bounds? position)) (fail :out-of-bounds)
       :else
       (let [entry {:type :building :kind kind :owner-id player-id :team (:team player)}
@@ -69,7 +98,7 @@
           (some #(occupied? (:objects state) %) footprint) (fail :object-blocked)
           (some player-positions footprint) (fail :player-blocked)
           (some protected-cells footprint) (fail :protected-area)
-          (> (apply min (map (fn [[x y]] (+ (abs (- x (:x player))) (abs (- y (:y player))))) footprint)) 2)
+          (> (distance-to-cells player footprint) 2)
           (fail :too-far)
           (some (fn [[item amount]] (< (get items item 0) amount)) (:cost spec)) (fail :insufficient-items)
           (not (access-safe? state (assoc (:objects state) position entry))) (fail :blocks-access)

@@ -10,7 +10,9 @@
 
 (defn process-message
   ([message] (process-message nil message))
-  ([connection {:keys [type player-id name token server-instance direction operation-id attempt-id tool building-type position]}]
+  ([connection {:keys [type player-id name token server-instance direction operation-id attempt-id
+                       tool building-type position building-id attack-seq repair-seq
+                       include-building-sequences]}]
    (case type
      :hello {:status :ok :server-instance (:instance @auth/state)}
      :register (if connection (auth/register! connection player-id name)
@@ -18,9 +20,16 @@
      :login (if connection (auth/login! connection player-id token server-instance)
                 (auth/failure :not-authenticated))
      :collect (auth/failure :collect-disabled)
-     :state {:status :ok :world (world/get-world)}
+     :state (if (and connection (true? include-building-sequences))
+              (dosync
+                (let [response {:status :ok :world (world/get-world)}]
+                  (if-let [id (auth/owner connection)]
+                    (assoc response :building-sequences (world/building-command-sequences id))
+                    response)))
+              {:status :ok :world (world/get-world)})
      :gather (auth/failure :gather-disabled)
-     (:move :gather-start :gather-heartbeat :gather-cancel :gather-finish :craft :build :build-check)
+     (:move :gather-start :gather-heartbeat :gather-cancel :gather-finish :craft :build :build-check
+      :attack-building :repair-building)
      (let [id (when connection (auth/owner connection))]
        (cond
          (nil? id) (auth/failure :not-authenticated)
@@ -32,6 +41,14 @@
          (= type :gather-heartbeat) (world/update-gather! id connection operation-id false)
          (= type :gather-finish) (world/update-gather! id connection operation-id true)
          (= type :gather-cancel) (world/cancel-gather! id connection operation-id attempt-id)
+         (#{:attack-building :repair-building} type)
+         (dosync (ensure auth/state)
+           (if (= id (auth/owner connection))
+             (assoc (if (= type :attack-building)
+                      (world/attack-building! id position building-id attack-seq)
+                      (world/repair-building! id position building-id repair-seq))
+                    :world (world/get-world))
+             (auth/failure :not-authenticated)))
          (#{:build :build-check} type)
          (dosync (ensure auth/state)
            (if (= id (auth/owner connection))

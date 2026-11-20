@@ -31,6 +31,12 @@
   (world/change-player-items! id stock))
 (defn- build! [id kind position]
   (server/process-message id {:type :build :player-id id :building-type kind :position position}))
+(defn- attack-command [id position building-id attack-seq]
+  {:type :attack-building :player-id id :position position
+   :building-id building-id :attack-seq attack-seq})
+(defn- repair-command [id position building-id repair-seq]
+  {:type :repair-building :player-id id :position position
+   :building-id building-id :repair-seq repair-seq})
 (defn- items [id] (get-in (world/get-world) [:players id :inventory :items]))
 (defn- race [operations]
   (let [ready (CountDownLatch. (count operations)) start (promise)
@@ -47,9 +53,15 @@
   (is (= :ok (:status (build! 1 :house [11 10]))))
   (is (= {:scores {:blue 17 :red 0} :phase :active :winner nil} (:match (world/get-world))))
   (is (= {:wood 13 :stone 10 :axe 0 :pickaxe 0} (items 1)))
-  (let [objects (:objects (world/get-world))]
+  (let [objects (:objects (world/get-world))
+        fence (objects [10 11])
+        house (objects [11 10])]
     (is (= 2 (count objects)))
-    (is (= {:type :building :kind :house :owner-id 1 :team :blue} (objects [11 10])))
+    (is (= {:type :building :kind :house :owner-id 1 :team :blue :hp 200 :max-hp 200}
+           (dissoc house :building-id)))
+    (is (= {:hp 50 :max-hp 50} (select-keys fence [:hp :max-hp])))
+    (is (every? uuid? (map :building-id [fence house])))
+    (is (not= (:building-id fence) (:building-id house)))
     (is (= #{[11 10] [12 10] [11 11] [12 11] [10 11]} (buildings/occupied-cells objects)))
     (is (not (contains? objects [12 11])))))
 
@@ -89,6 +101,52 @@
   (player! 1 [14 10] {:wood 15 :stone 10})
   (is (= :ok (:status (build! 1 :house [11 10])))))
 
+(deftest lookup-building-by-occupied-cell-test
+  (let [house {:type :building :kind :house :building-id (random-uuid)}
+        fence {:type :building :kind :fence :building-id (random-uuid)}
+        objects {[11 10] house [15 10] fence [10 10] :house [2 2] :tree}]
+    (doseq [cell [[11 10] [12 10] [11 11] [12 11]]]
+      (is (= {:anchor [11 10] :building house} (buildings/target-at objects cell))))
+    (is (= {:anchor [15 10] :building fence} (buildings/target-at objects [15 10])))
+    (doseq [cell [[10 10] [13 11] [2 2] [-1 0] [11.5 10] nil]]
+      (is (nil? (buildings/target-at objects cell))))
+    (is (nil? (buildings/target-at (assoc objects [12 11] fence) [12 11])))))
+
+(deftest interaction-distance-to-building-test
+  (let [objects {[11 10] {:type :building :kind :house}
+                 [15 10] {:type :building :kind :fence}}
+        house (buildings/target-at objects [12 11])
+        fence (buildings/target-at objects [15 10])]
+    (doseq [[target player distance] [[house {:x 13 :y 11} 1]
+                                      [house {:x 13 :y 12} 2]
+                                      [house {:x 12 :y 12} 1]
+                                      [house {:x 11 :y 10} 0]
+                                      [fence {:x 14 :y 10} 1]
+                                      [fence {:x 14 :y 11} 2]]]
+      (is (= distance (buildings/distance-to-building player target)))
+      (is (= (= 1 distance) (buildings/adjacent-to-building? player target))))))
+
+(deftest migrate-building-durability-test
+  (let [id (random-uuid)
+        house {:type :building :kind :house :team :blue :building-id id :hp 17}
+        fence {:type :building :kind :fence :owner-id 99}
+        objects {[5 5] house [8 8] fence [9 9] :house [1 1] :tree [2 2] :stone}]
+    (dosync (alter world/world assoc :objects objects))
+    (let [before (world/get-world)]
+      (world/migrate-building-durability!)
+      (let [state (world/get-world)
+            migrated (:objects state)
+            new-id (get-in migrated [[8 8] :building-id])]
+        (is (uuid? new-id))
+        (is (not= id new-id))
+        (is (= (assoc objects
+                      [5 5] (assoc house :max-hp 200)
+                      [8 8] (assoc fence :building-id new-id :hp 50 :max-hp 50))
+               migrated))
+        (is (= (dissoc before :objects) (dissoc state :objects)))
+        (world/migrate-building-durability!)
+        (is (= state (world/get-world)))))))
+
 (deftest existing-objects-and-disconnected-players-block-test
   (player! 1 [10 10] {:wood 50 :stone 50})
   (doseq [object [:tree :stone :house {:type :building :kind :fence :owner-id 2}]]
@@ -109,11 +167,17 @@
   (let [before (world/get-world)]
     (is (= :ok (:status (server/process-message 1 {:type :build-check :player-id 1 :building-type :fence :position [11 10]}))))
     (is (= before (world/get-world))))
-  (is (= :ok (:status (server/process-message 1 {:type :build :player-id 1 :building-type :fence :position [11 10]
-                                                 :cost {:wood 0} :owner-id 99 :team :red :size [0 0]}))))
-  (is (= 8 (:wood (items 1))))
-  (is (= {:owner-id 1 :team :blue}
-         (select-keys (get-in (world/get-world) [:objects [11 10]]) [:owner-id :team]))))
+  (let [fake-id (random-uuid)
+        result (server/process-message 1 {:type :build :player-id 1 :building-type :fence :position [11 10]
+                                         :cost {:wood 0} :owner-id 99 :team :red :size [0 0]
+                                         :building-id fake-id :hp 1 :max-hp 1})
+        building (get-in (world/get-world) [:objects [11 10]])]
+    (is (= :ok (:status result)))
+    (is (= 8 (:wood (items 1))))
+    (is (= building (:building result)))
+    (is (not= fake-id (:building-id building)))
+    (is (= {:owner-id 1 :team :blue :hp 50 :max-hp 50}
+           (select-keys building [:owner-id :team :hp :max-hp])))))
 
 (deftest concurrent-building-and-spending-test
   (player! 1 [10 10] {:wood 2}) (player! 2 [12 10] {:wood 2})
@@ -125,6 +189,236 @@
   (player! 1 [10 10] {:wood 15 :stone 10}) (player! 2 [14 10] {:wood 15 :stone 10})
   (is (= {:ok 1 :error 1} (frequencies (map :status (race [#(build! 1 :house [11 10]) #(build! 2 :house [12 10])])))))
   (is (= 4 (count (buildings/occupied-cells (:objects (world/get-world)))))))
+
+(deftest attack-authorization-target-and-distance-test
+  (player! 1 [10 10] {:wood 2})
+  (player! 2 [12 11] {})
+  (let [id (get-in (build! 1 :fence [11 10]) [:building :building-id])
+        command (attack-command 2 [11 10] id 1)
+        orphan (buildings/initialize-durability {:type :building :kind :fence})]
+    (dosync (alter world/world update :objects assoc [12 12] orphan [13 11] :house))
+    (is (= :not-authenticated (:code (server/process-message :unknown command))))
+    (is (= :wrong-player (:code (server/process-message 1 command))))
+    (is (= :invalid-target-team (:code (server/process-message 1 (assoc command :player-id 1)))))
+    (is (= :too-far (:code (server/process-message 2 command))))
+    (is (= :building-not-found (:code (server/process-message 2 (assoc command :position [13 11] :attack-seq 2)))))
+    (is (= :invalid-target-team (:code (server/process-message 2 (assoc command :position [12 12]
+                                                                      :building-id (:building-id orphan) :attack-seq 3)))))
+    (dosync (alter world/world update-in [:players 2] assoc :x 12 :y 10))
+    (let [result (server/process-message 2 (assoc command :attack-seq 4 :damage 500
+                                                 :team :blue :owner-id 2 :hp 0 :max-hp 1))]
+      (is (= :ok (:status result)))
+      (is (= 40 (:hp result)))
+      (is (= {:hp 40 :team :blue :owner-id 1 :max-hp 50}
+             (select-keys (get-in result [:world :objects [11 10]]) [:hp :team :owner-id :max-hp]))))))
+
+(deftest attack-cooldown-and-replay-survive-reconnect-test
+  (player! 1 [10 10] {:wood 4})
+  (let [registered (server/process-message 2 {:type :register :player-id 2 :name "Red"})
+        a (get-in (build! 1 :fence [11 10]) [:building :building-id])
+        b (get-in (build! 1 :fence [10 11]) [:building :building-id])
+        first-hit (attack-command 2 [11 10] a 1)
+        second-hit (attack-command 2 [10 11] b 2)
+        clock (atom 0)]
+    (with-redefs [world/now-ns #(deref clock)]
+      (dosync (alter world/world update-in [:players 2] assoc :x 11 :y 11))
+      (is (= 40 (:hp (server/process-message 2 first-hit))))
+      (auth/disconnect! 2)
+      (is (= :ok (:status (server/process-message :new
+                            (assoc (select-keys registered [:token :server-instance])
+                                   :type :login :player-id 2)))))
+      (is (= 40 (:hp (server/process-message :new first-hit))))
+      (is (= :attack-seq-conflict (:code (server/process-message :new (assoc second-hit :attack-seq 1)))))
+      (reset! clock 999999999)
+      (is (= :attack-cooldown (:code (server/process-message :new second-hit))))
+      (is (= :stale-attack (:code (server/process-message :new first-hit))))
+      (reset! clock 1000000000)
+      (is (= :attack-cooldown (:code (server/process-message :new second-hit))))
+      (let [hit (server/process-message :new (assoc second-hit :attack-seq 3))]
+        (is (= 40 (:hp hit)))
+        (is (= 40 (get-in hit [:world :objects [11 10] :hp])))
+        (is (= 40 (get-in hit [:world :objects [10 11] :hp])))
+        (is (not (contains? (:world hit) :building-attacks)))))))
+
+(deftest destroy-house-releases-footprint-and-rejects-old-target-test
+  (player! 1 [10 10] {:wood 30 :stone 20})
+  (player! 2 [13 11] {})
+  (let [anchor [11 10]
+        house (:building (build! 1 :house anchor))
+        command (attack-command 2 [12 11] (:building-id house) 1)
+        clock (atom 0)]
+    (with-redefs [world/now-ns #(deref clock)]
+      (doseq [n (range 1 20)]
+        (is (= (- 200 (* 10 n)) (:hp (server/process-message 2 (assoc command :attack-seq n)))))
+        (swap! clock + 1000000000))
+      (let [final-hit (assoc command :attack-seq 20)
+            result (server/process-message 2 final-hit)]
+        (is (= {:hp 0 :destroyed? true} (select-keys result [:hp :destroyed?])))
+        (is (= result (server/process-message 2 final-hit)))
+        (is (= {:blue 0 :red 0} (get-in result [:world :match :scores])))
+        (doseq [cell (buildings/cells anchor house)]
+          (is (world/free-cell? (:world result) cell))))
+      (is (= :ok (:status (build! 1 :house anchor))))
+      (swap! clock + 1000000000)
+      (let [result (server/process-message 2 (assoc command :attack-seq 21))]
+        (is (= :stale-building (:code result)))
+        (is (= 200 (get-in result [:world :objects anchor :hp])))))))
+
+(deftest concurrent-attacks-from-one-player-apply-only-one-hit-test
+  (player! 1 [10 10] {:wood 2})
+  (player! 2 [12 10] {})
+  (let [id (get-in (build! 1 :fence [11 10]) [:building :building-id])
+        command (attack-command 2 [11 10] id 1)
+        attack #(server/process-message 2 %)]
+    (with-redefs [world/now-ns (constantly 0)]
+      (let [results (race [#(attack command) #(attack command)])]
+        (is (= [40 40] (mapv :hp results)))
+        (is (= 40 (get-in (world/get-world) [:objects [11 10] :hp])))))
+    (with-redefs [world/now-ns (constantly 1000000000)]
+      (let [results (race [#(attack (assoc command :attack-seq 2))
+                           #(attack (assoc command :attack-seq 3))])]
+        (is (= {:ok 1 :error 1} (frequencies (map :status results))))
+        (is (= 30 (get-in (world/get-world) [:objects [11 10] :hp])))))))
+
+(deftest concurrent-final-hits-remove-building-once-test
+  (player! 1 [10 10] {:wood 2})
+  (player! 2 [12 10] {})
+  (player! 3 [14 10] {})
+  (player! 4 [11 11] {})
+  (let [position [11 10]
+        id (get-in (build! 1 :fence position) [:building :building-id])]
+    (dosync (alter world/world assoc-in [:objects position :hp] 10))
+    (let [results (race (mapv (fn [player-id]
+                                #(server/process-message player-id (attack-command player-id position id 1)))
+                              [2 4]))]
+      (is (= {:ok 1 :error 1} (frequencies (map :status results))))
+      (is (= 1 (count (filter :destroyed? results))))
+      (is (= [:building-not-found] (keep :code results)))
+      (is (= {:blue 0 :red 0} (get-in (world/get-world) [:match :scores])))
+      (is (world/free-cell? (world/get-world) position)))))
+
+(deftest repair-uses-server-price-and-caps-healing-test
+  (player! 1 [10 10] {:wood 17 :stone 10})
+  (player! 2 [14 11] {:wood 1})
+  (player! 3 [13 11] {:wood 2})
+  (let [anchor [11 10]
+        id (get-in (build! 1 :house anchor) [:building :building-id])
+        repair #(repair-command 3 [12 11] id %)]
+    (dosync (alter world/world assoc-in [:objects anchor :hp] 186))
+    (let [result (server/process-message 3 (assoc (repair 1)
+                                                 :cost {:wood 0} :hp 999 :restored-hp 999
+                                                 :team :red :owner-id 3 :max-hp 999))]
+      (is (= {:status :ok :hp 196 :restored-hp 10 :anchor anchor :building-id id}
+             (dissoc result :world)))
+      (is (= 1 (:wood (items 3))))
+      (is (= 2 (:wood (items 1)))))
+    (let [result (server/process-message 3 (repair 2))]
+      (is (= {:hp 200 :restored-hp 4} (select-keys result [:hp :restored-hp])))
+      (is (zero? (:wood (items 3)))))
+    (let [state (world/get-world)]
+      (is (= :building-at-full-hp (:code (server/process-message 3 (repair 3)))))
+      (is (= state (world/get-world)))
+      (is (= {:blue 15 :red 0} (get-in state [:match :scores]))))))
+
+(deftest repair-validates-authority-and-target-without-charging-test
+  (player! 1 [10 10] {:wood 2})
+  (player! 2 [12 10] {:wood 1})
+  (let [anchor [11 10]
+        id (get-in (build! 1 :fence anchor) [:building :building-id])
+        orphan (buildings/initialize-durability {:type :building :kind :fence})
+        repair #(repair-command 1 anchor id %)]
+    (dosync (alter world/world assoc-in [:objects anchor :hp] 20)
+            (alter world/world update :objects assoc [10 9] orphan [10 11] :house))
+    (let [before (world/get-world)]
+      (is (= :not-authenticated (:code (server/process-message :unknown (repair 1)))))
+      (is (= :wrong-player (:code (server/process-message 2 (repair 1)))))
+      (is (= :invalid-target-team (:code (server/process-message 2 (assoc (repair 1) :player-id 2 :team :blue)))))
+      (is (= :insufficient-items (:code (server/process-message 1 (repair 1)))))
+      (is (= :stale-building (:code (server/process-message 1 (assoc (repair 2) :building-id (random-uuid))))))
+      (is (= :invalid-target-team (:code (server/process-message 1 (assoc (repair 3) :position [10 9]
+                                                                        :building-id (:building-id orphan))))))
+      (is (= :building-not-found (:code (server/process-message 1 (assoc (repair 4) :position [10 11])))))
+      (is (= before (world/get-world))))
+    (world/change-player-items! 1 {:wood 1})
+    (is (= :ok (:status (server/process-message 1 {:type :move :player-id 1 :direction :left}))))
+    (let [before (world/get-world)]
+      (is (= :too-far (:code (server/process-message 1 (repair 5)))))
+      (is (= before (world/get-world))))))
+
+(deftest repair-replay-survives-reconnect-test
+  (let [registration (server/process-message 1 {:type :register :player-id 1 :name "Blue"})
+        anchor [11 10]]
+    (dosync (alter world/world update-in [:players 1] assoc :x 10 :y 10))
+    (world/change-player-items! 1 {:wood 5})
+    (let [id (get-in (build! 1 :fence anchor) [:building :building-id])
+          command (repair-command 1 anchor id 1)]
+      (dosync (alter world/world assoc-in [:objects anchor :hp] 20))
+      (let [initial (server/process-message 1 command)]
+        (is (= 30 (:hp initial)))
+        (auth/disconnect! 1)
+        (is (= :ok (:status (server/process-message :new
+                              (assoc (select-keys registration [:token :server-instance])
+                                     :type :login :player-id 1)))))
+        (is (= initial (server/process-message :new command)))
+        (is (= :repair-seq-conflict (:code (server/process-message :new (assoc command :position [9 10])))))
+        (is (= 2 (:wood (items 1))))
+        (is (= 40 (:hp (server/process-message :new (assoc command :repair-seq 2)))))
+        (is (= :stale-repair (:code (server/process-message :new command))))
+        (is (= 1 (:wood (items 1))))))))
+
+(deftest concurrent-repairs-cannot-double-charge-or-exceed-max-hp-test
+  (player! 1 [10 10] {:wood 4})
+  (player! 2 [14 10] {})
+  (player! 3 [12 10] {:wood 2})
+  (let [anchor [11 10]
+        id (get-in (build! 1 :fence anchor) [:building :building-id])
+        request #(server/process-message %1 (repair-command %1 anchor id %2))]
+    (dosync (alter world/world assoc-in [:objects anchor :hp] 34))
+    (is (= [44 44] (mapv :hp (race [#(request 1 1) #(request 1 1)]))))
+    (is (= 1 (:wood (items 1))))
+    (let [results (race [#(request 1 2) #(request 3 1)])]
+      (is (= {:ok 1 :error 1} (frequencies (map :status results))))
+      (is (= [:building-at-full-hp] (keep :code results)))
+      (is (= 50 (get-in (world/get-world) [:objects anchor :hp])))
+      (is (= 2 (+ (:wood (items 1)) (:wood (items 3))))))))
+
+(deftest repair-races-with-destruction-test
+  (player! 1 [10 10] {:wood 3})
+  (player! 2 [12 10] {})
+  (let [anchor [11 10]
+        id (get-in (build! 1 :fence anchor) [:building :building-id])
+        repair (repair-command 1 anchor id 1)
+        hit (attack-command 2 anchor id 1)]
+    (dosync (alter world/world assoc-in [:objects anchor :hp] 10))
+    (let [[repaired attacked] (race [#(server/process-message 1 repair) #(server/process-message 2 hit)])
+          state (world/get-world)]
+      (is (= :ok (:status attacked)))
+      (if (:destroyed? attacked)
+        (do
+          (is (= :building-not-found (:code repaired)))
+          (is (nil? (get-in state [:objects anchor])))
+          (is (= {:blue 0 :red 0} (get-in state [:match :scores])))
+          (is (= 1 (:wood (items 1)))))
+        (do
+          (is (= 20 (:hp repaired)))
+          (is (= 10 (get-in state [:objects anchor :hp])))
+          (is (= {:blue 2 :red 0} (get-in state [:match :scores])))
+          (is (zero? (:wood (items 1)))))))))
+
+(deftest repair-and-construction-cannot-overspend-wood-test
+  (player! 1 [10 10] {:wood 4})
+  (let [anchor [11 10]
+        id (get-in (build! 1 :fence anchor) [:building :building-id])]
+    (dosync (alter world/world assoc-in [:objects anchor :hp] 20))
+    (let [results (race [#(server/process-message 1 (repair-command 1 anchor id 1))
+                         #(build! 1 :fence [10 11])])
+          state (world/get-world)
+          repaired? (= :ok (:status (first results)))]
+      (is (= {:ok 1 :error 1} (frequencies (map :status results))))
+      (is (= [:insufficient-items] (keep :code results)))
+      (is (= (if repaired? 1 0) (:wood (items 1))))
+      (is (= (if repaired? 30 20) (get-in state [:objects anchor :hp])))
+      (is (= (if repaired? 2 4) (get-in state [:match :scores :blue]))))))
 
 (defn- put-legacy-fences! [teams]
   (dosync
@@ -178,6 +472,13 @@
       (is (= :ok (:status (build! 1 :fence [11 10]))))
       (is (empty? @world/gathering))
       (let [state (world/get-world)]
+        (let [id (get-in state [:objects [11 10] :building-id])
+              attack (server/process-message 2 (attack-command 2 [11 10] id 1))
+              repair (server/process-message 1 (repair-command 1 [11 10] id 1))]
+          (is (= :match-finished (:code attack)))
+          (is (= state (:world attack)))
+          (is (= :match-finished (:code repair)))
+          (is (= state (:world repair))))
         (doseq [command [{:type :move :direction :down}
                          {:type :craft :tool :axe}
                          {:type :build :building-type :fence :position [10 11]}
@@ -267,6 +568,97 @@
 (defn- edt! [f]
   (let [result (promise)] (SwingUtilities/invokeAndWait #(deliver result (f))) @result))
 
+(deftest building-action-controls-and-snapshots-test
+  (edt!
+   (bound-fn []
+     (let [player-id 10101 player {:x 13 :y 11 :team :blue}
+           panel (gui/create-map-panel 13 11 player-id)
+           label (JLabel.)
+           anchor [11 10]
+           id (random-uuid)
+           house {:type :building :kind :house :team :red :building-id id :hp 30 :max-hp 200}
+           snapshot {:players {player-id player} :objects {anchor house [14 10] :house}}
+           displayed (atom snapshot)
+           applied! (fn [world]
+                      (reset! displayed world)
+                      (gui/update-map panel (:players world) (:objects world)))
+           pending (atom [])
+           camera (rendering/camera player 800 600)
+           point (fn [[x y]] [(- (+ (* x 64) 32) (:x camera)) (- (+ (* y 64) 32) (:y camera))])
+           event (fn [cell type button]
+                   (let [[x y] (point cell)]
+                     (java.awt.event.MouseEvent. panel type 0 0 x y 1 false button)))
+           hover! (fn [cell]
+                    (doseq [listener (.getMouseMotionListeners panel)]
+                      (.mouseMoved listener (event cell java.awt.event.MouseEvent/MOUSE_MOVED 0))))
+           click! (fn [cell]
+                    (doseq [listener (.getMouseListeners panel)]
+                      (.mouseClicked listener (event cell java.awt.event.MouseEvent/MOUSE_CLICKED 1))))
+           key! (fn [action] (.actionPerformed (.get (.getActionMap panel) action) nil))
+           reply! (fn [response]
+                    (let [[_ callback] (peek @pending)] (callback response)))]
+       (.setSize panel 800 600)
+       (applied! snapshot)
+       (with-redefs [client/async! (fn [_ _ message callback] (swap! pending conj [message callback]) true)]
+         (let [controller (building-ui/install! panel {} player-id label applied! (fn [])
+                                                {:attack-seq 8 :repair-seq 4})]
+           (try
+             (doseq [cell [[11 10] [12 10] [11 11] [12 11]]]
+               (hover! cell)
+               (is (= "Деревянный дом (красные) — 30/200 HP" (.getToolTipText panel))))
+             (hover! [14 10])
+             (is (nil? (.getToolTipText panel)))
+             (key! "attack-mode")
+             (is (= :attack (:mode @(:state controller))))
+             (key! "attack-mode")
+             (is (nil? @(:state controller)))
+             ((:select! controller) :fence)
+             (is (= :build (:mode @(:state controller))))
+             (key! "attack-mode")
+             (is (= :attack (:mode @(:state controller))))
+             (click! [14 10])
+             (is (empty? @pending))
+             (is (= "Постройка не найдена." (.getText label)))
+             (click! [12 11])
+             (click! [12 11])
+             (is (= 1 (count @pending)))
+             (is (= (attack-command player-id [12 11] id 9) (first (peek @pending))))
+             (reply! {:status :error :code :attack-cooldown})
+             (is (re-find #"через секунду" (.getText label)))
+             (hover! [12 11])
+             (click! [12 11])
+             (is (= (attack-command player-id [12 11] id 10) (first (peek @pending))))
+             (reply! {:status :ok :hp 20 :world (assoc-in snapshot [:objects anchor :hp] 20)})
+             (is (= "Деревянный дом (красные) — 20/200 HP" (.getToolTipText panel)))
+             (key! "repair-mode")
+             (is (= :repair (:mode @(:state controller))))
+             (click! [11 11])
+             (is (= (repair-command player-id [11 11] id 5) (first (peek @pending))))
+             (reply! {:status :error :code :invalid-target-team})
+             (is (= "Ремонтировать можно только союзные постройки." (.getText label)))
+             (applied! (assoc-in @displayed [:objects anchor :team] :blue))
+             (click! [11 11])
+             (is (= (repair-command player-id [11 11] id 6) (first (peek @pending))))
+             (reply! {:status :ok :restored-hp 10 :world (assoc-in @displayed [:objects anchor :hp] 30)})
+             (is (= "Деревянный дом (синие) — 30/200 HP" (.getToolTipText panel)))
+             (is (= "Восстановлено 10 HP." (.getText label)))
+             ((:select! controller) :house)
+             (is (= :build (:mode @(:state controller))))
+             (finally ((:close! controller)))))
+         (let [reopened (building-ui/install! panel {} player-id label applied! (fn [])
+                                             {:attack-seq 9 :repair-seq 5})]
+           (try
+             (key! "attack-mode")
+             (hover! [12 11])
+             (click! [12 11])
+             (is (= (attack-command player-id [12 11] id 11) (first (peek @pending))))
+             (reply! {:status :ok :destroyed? true :world (assoc snapshot :objects {} :match world/initial-match)})
+             (is (nil? (.getToolTipText panel)))
+             (is (world/free-cell? @displayed anchor))
+             (is (= {:blue 0 :red 0} (get-in @displayed [:match :scores])))
+             (is (= "Постройка разрушена." (.getText label)))
+             (finally ((:close! reopened))))))))))
+
 (deftest asynchronous-preview-and-placement-at-offset-camera-test
   (player! 1 [10 10] {:wood 10})
   (let [queue (transport/create-queue #(server/process-message 1 %))
@@ -347,9 +739,36 @@
             (is (= state (:world (client/request a {:type :state}))))
             (is (= {:blue 2 :red 0} (get-in state [:match :scores])))
             (is (= [:blue :red] (mapv #(get-in state [:players % :team]) [1 2])))
-            (is (= {:type :building :kind :fence :owner-id 1 :team :blue}
-                   (get-in state [:objects [11 10]]))))
-          (is (= :object-blocked (:code (client/request b {:type :move :player-id 2 :direction :left})))))
+            (let [building (get-in state [:objects [11 10]])]
+              (is (uuid? (:building-id building)))
+              (is (= {:type :building :kind :fence :owner-id 1 :team :blue :hp 50 :max-hp 50}
+                     (dissoc building :building-id)))))
+          (is (= :object-blocked (:code (client/request b {:type :move :player-id 2 :direction :left}))))
+          (let [id (get-in (world/get-world) [:objects [11 10] :building-id])
+                clock (atom 0)]
+            (with-redefs [world/now-ns #(deref clock)]
+              (is (= 40 (:hp (client/request b (attack-command 2 [11 10] id 1)))))
+              (let [repaired (client/request a (repair-command 1 [11 10] id 1))]
+                (is (= {:hp 50 :restored-hp 10} (select-keys repaired [:hp :restored-hp])))
+                (is (= 7 (get-in repaired [:world :players 1 :inventory :items :wood])))
+                (is (= (:world repaired) (:world (client/request b {:type :state}))))
+                (is (= repaired (client/request a (repair-command 1 [11 10] id 1)))))
+              (swap! clock + 1000000000)
+              (doseq [n (range 2 7)]
+                (let [result (client/request b (attack-command 2 [11 10] id n))]
+                  (is (= (- 50 (* 10 (dec n))) (:hp result)))
+                  (is (= (:world result) (:world (client/request a {:type :state})))))
+                (swap! clock + 1000000000)))
+            (let [state (:world (client/request b {:type :state}))]
+              (is (= state (:world (client/request a {:type :state}))))
+              (is (nil? (get-in state [:objects [11 10]])))
+              (is (= {:blue 0 :red 0} (get-in state [:match :scores]))))
+            (let [request {:type :state :include-building-sequences true :player-id 2}]
+              (is (= {:attack-seq 0 :repair-seq 1} (:building-sequences (client/request a request))))
+              (is (= {:attack-seq 6 :repair-seq 0} (:building-sequences (client/request b request))))
+              (is (nil? (:building-sequences (client/request (open!) request))))
+              (is (nil? (:building-sequences (client/request a {:type :state})))))
+            (is (= :ok (:status (client/request b {:type :move :player-id 2 :direction :left}))))))
         (finally
           (doseq [[connection handler] @connections]
             (client/close-connection connection) (deref handler 5000 nil) (future-cancel handler)))))))
