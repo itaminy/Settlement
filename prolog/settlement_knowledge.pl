@@ -1,6 +1,7 @@
 :- module(settlement_knowledge,
           [ load_snapshot/1, apply_event/1, reset_knowledge/0,
             player/5, resource/3, known_resource/3, building/8, obstacle/3, world_size/2,
+            bandit/7, downed/1, bot_health/1, reserved/2,
             score/2, inventory_item/2, world_version/1, match_state/2,
             bot_identity/2, world_totals/2, command_sequences/2,
             online_player/1, gathering_player/1,
@@ -14,6 +15,7 @@
 :- dynamic score/2, inventory_item/2, world_version/1, match_state/2.
 :- dynamic bot_identity/2, world_totals/2, command_sequences/2.
 :- dynamic online_player/1, gathering_player/1.
+:- dynamic bandit/7, downed/1, health/2, reserved/2.
 :- dynamic event_cursor/1, resync_pending/0.
 
 % The module stores one active session. Reset at a connection boundary before
@@ -62,6 +64,9 @@ world_facts(world(size(Width, Height), Self, Players, Objects, totals(TotalWood,
     is_list(Players), is_list(Objects),
     maplist(player_key(Width, Height), Players, PlayerIds),
     unique(PlayerIds),
+    forall(member(downed(Id), Objects), memberchk(Id, PlayerIds)),
+    forall(member(health(Id, HP), Objects),
+           (Id == Self, (memberchk(downed(Id), Objects) -> HP == 0 ; HP > 0))),
     memberchk(player(Self, _, _, Team, _), Players),
     maplist(object_key(Width, Height), Objects, Cells, BuildingIds),
     unique(Cells),
@@ -84,6 +89,16 @@ object_key(Width, Height, resource(X, Y, Type), X-Y, none) :-
     cell(Width, Height, X, Y), memberchk(Type, [tree, stone]).
 object_key(Width, Height, obstacle(X, Y, Kind), X-Y, none) :-
     cell(Width, Height, X, Y), token(Kind).
+object_key(_, _, downed(Id), downed-Id, none) :- positive(Id).
+object_key(_, _, health(Id, HP), health-Id, none) :-
+    positive(Id), natural(HP), HP =< 100.
+object_key(Width, Height, reserved(X, Y), reserved(X,Y), none) :- cell(Width, Height, X, Y).
+object_key(_, _, bandit(Id, none, none, 0, Max, "waiting", Direction), bandit-Id, Id) :-
+    uuid(Id), positive(Max), bandit_direction(Direction).
+object_key(Width, Height, bandit(Id, X, Y, HP, Max, State, Direction), X-Y, Id) :-
+    uuid(Id), cell(Width, Height, X, Y), positive(HP), positive(Max), HP =< Max,
+    memberchk(State, ["patrol", "search", "chase", "attack", "return"]),
+    bandit_direction(Direction).
 object_key(Width, Height, building(Id, X, Y, Kind, Team, Owner, HP, MaxHP), X-Y, Id) :-
     cell(Width, Height, X, Y), token(Kind), optional(uuid, Id),
     optional(team, Team), optional(natural, Owner),
@@ -91,6 +106,8 @@ object_key(Width, Height, building(Id, X, Y, Kind, Team, Owner, HP, MaxHP), X-Y,
 
 cell(Width, Height, X, Y) :-
     natural(X), natural(Y), X < Width, Y < Height.
+
+bandit_direction(Direction) :- memberchk(Direction, ["up", "down", "left", "right"]).
 
 valid_ids(Ids) :-
     is_list(Ids), maplist(positive, Ids), unique(Ids).
@@ -123,6 +140,10 @@ clear_knowledge :-
     retractall(resource(_, _, _)),
     retractall(building(_, _, _, _, _, _, _, _)),
     retractall(obstacle(_, _, _)),
+    retractall(bandit(_, _, _, _, _, _, _)),
+    retractall(downed(_)),
+    retractall(health(_, _)),
+    retractall(reserved(_, _)),
     retractall(world_size(_, _)),
     retractall(score(_, _)),
     retractall(inventory_item(_, _)),
@@ -170,6 +191,10 @@ needs_resync :-
 
 bot_position(X, Y) :-
     snapshot((bot_identity(Id, Team), player(Id, X, Y, Team, _))).
+
+bot_health(HP) :-
+    bot_identity(Id, _),
+    ( health(Id, HP) -> true ; downed(Id) -> HP = 0 ; HP = 100 ).
 
 % Type is tree or stone (or unbound for either). Manhattan distance assumes
 % four-direction movement. Ties use X, then Y. Fails with no matching resource.

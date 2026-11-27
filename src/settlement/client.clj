@@ -15,9 +15,11 @@
 
 (declare request)
 
-(defn connect []
-  (let [socket (doto (Socket.)
-                 (.connect (java.net.InetSocketAddress. "127.0.0.1" 5000) 5000)
+(defn connect
+  ([] (connect "127.0.0.1" 5000))
+  ([host port]
+   (let [socket (doto (Socket.)
+                 (.connect (java.net.InetSocketAddress. host port) 5000)
                  (.setSoTimeout 5000))
         reader (BufferedReader.
                 (InputStreamReader. (.getInputStream socket) "UTF-8"))
@@ -25,7 +27,8 @@
                 (OutputStreamWriter. (.getOutputStream socket) "UTF-8"))]
 
     (let [connection {:socket socket :reader reader :writer writer}]
-      (assoc connection :queue (transport/create-queue #(request connection %) #(.close socket))))))
+      (assoc connection :endpoint (str host ":" port)
+             :queue (transport/create-queue #(request connection %) #(.close socket)))))))
 
 (defn close-connection [connection]
   (.close (:socket connection))
@@ -38,19 +41,24 @@
 (defn async!
   ([connection key message callback] (async! connection key message callback (constantly true) false))
   ([connection key message callback current? priority?]
-   (let [queue (:queue connection)]
+   (async! connection key message callback current? current? priority?))
+  ([connection key message callback send? deliver? priority?]
+   (let [queue (:queue connection)
+         message (if-let [match-id (:match-id connection)]
+                   (if (contains? message :match-id) message (assoc message :match-id @match-id))
+                   message)]
      (transport/submit! queue key message
        (fn [response]
          (javax.swing.SwingUtilities/invokeLater
           #(when (and (or (not @(:closed queue)) (= :connection-failed (:code response)))
-                      (current?)) (callback response))))
-       current? priority?))))
+                      (deliver?)) (callback response))))
+       send? priority?))))
 
 (defn authorize!
   "Callbacks receive no secrets. A failed save can be retried on the live connection."
   [connection player-id player-name confirm-new? retry-save?]
   (try
-    (let [server "127.0.0.1:5000"
+    (let [server (:endpoint connection "127.0.0.1:5000")
           hello (request connection {:type :hello})
           instance (:server-instance hello)
           entry (credentials/load-entry server player-id)
@@ -62,7 +70,8 @@
         (request connection {:type :login :player-id player-id
                              :token (:token entry) :server-instance instance})
         :else
-        (let [registration (request connection {:type :register :player-id player-id :name player-name})]
+        (let [registration (request connection {:type :register :player-id player-id :name player-name
+                                                :client-kind :human})]
           (if (= :ok (:status registration))
             (loop []
               (let [saved (credentials/save-entry! server player-id instance (:token registration))]

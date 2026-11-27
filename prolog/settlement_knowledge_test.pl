@@ -49,6 +49,17 @@ test(full_snapshot, [setup(reset_knowledge)]) :-
     assertion(gathering_player(2)),
     assertion(\+ needs_resync).
 
+test(health_record_parses_and_rejects_health_for_another_player, [setup(reset_knowledge)]) :-
+    Header = 'reply v=1 ok world-versioned version=1 width=8 height=7 self=1 players=[player(1,3,3,blue,"Bot"),player(2,0,0,red,"Other")]',
+    Tail = 'total_wood=0 total_stone=0 blue=0 red=0 phase=active winner=none inventory_wood=0 inventory_stone=0 inventory_axe=0 inventory_pickaxe=0 attack_seq=0 repair_seq=0 online=[1,2] gathering=[]',
+    format(string(First), '~w objects=[health(1,20)] ~w', [Header,Tail]),
+    parse_frame(First, ok(Valid)), load_snapshot(Valid),
+    assertion(bot_health(20)),
+    format(string(Second), '~w objects=[health(2,15)] ~w', [Header,Tail]),
+    parse_frame(Second, ok(Invalid)),
+    assertion(\+ load_snapshot(Invalid)),
+    assertion(bot_health(20)).
+
 test(replace_and_reload_without_duplicates, [setup(reset_knowledge)]) :-
     load_full,
     replacement(11, Frame),

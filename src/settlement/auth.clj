@@ -22,15 +22,17 @@
 (defn owner [connection]
   (some (fn [[id session]] (when (= session connection) id)) (:sessions @state)))
 
-(defn register! [connection id name]
-  (if-not (and (integer? id) (pos? id) (string? name) (not (empty? name)))
+(defn register! [connection id name client-kind]
+  (if-not (and (integer? id) (pos? id) (string? name) (not (empty? name))
+               (contains? #{nil :human :prolog} client-kind))
     (failure :invalid-registration)
     (dosync
       (cond
         (owner connection) (failure :already-authenticated)
         (contains? (:players @world/world) id) (failure :player-exists)
         (world/match-finished? @world/world) (failure :match-finished)
-        (not (world/add-player id name)) (failure :map-full)
+        (not (world/add-player id name (if (= :prolog client-kind) :red :blue)))
+        (failure :map-full)
         :else
         (let [secret (token)]
           (alter state assoc-in [:credentials id] (digest secret))

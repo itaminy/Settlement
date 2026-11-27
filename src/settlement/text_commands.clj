@@ -27,6 +27,11 @@
    ["отмени" "попытку"] [[{:type :gather-cancel} ["добычи" :attempt-id]]]
    ["построй" "забор"] [[{:type :build :building-type :fence} ["на" :x :y]]]
    ["построй" "дом"] [[{:type :build :building-type :house} ["на" :x :y]]]
+   ["построй" "башню"] [[{:type :build :building-type :watchtower} ["на" :x :y]]]
+   ["построй" "сторожевую"] [[{:type :build :building-type :watchtower} ["башню" "на" :x :y]]]
+   ["построй" "лесопилку"] [[{:type :build :building-type :sawmill} ["на" :x :y]]]
+   ["построй" "шахту"] [[{:type :build :building-type :mine} ["на" :x :y]]]
+   ["атакуй" "бандита"] [[{:type :attack-bandit} ["на" :x :y "id" :bandit-id "номер" :attack-seq]]]
    ["атакуй" "постройку"] [[{:type :attack-building}
                            ["на" :x :y "id" :building-id "номер" :attack-seq]]]
    ["почини" "постройку"] [[{:type :repair-building}
@@ -50,7 +55,7 @@
          (when (<= 0 n (dec config/world-height)) n))
     (:attack-seq :repair-seq) (when-let [n (decimal token)]
                                (when (pos? n) n))
-    :building-id (uuid-value token)
+    (:building-id :bandit-id) (uuid-value token)
     (:attempt-id :operation-id) (when-let [id (uuid-value token)]
                                   (str id))))
 

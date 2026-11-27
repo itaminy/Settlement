@@ -1,2 +1,16 @@
 .cpcache/
 .settlement/
+
+# Temporary development artifacts
+.natural-canyon-frames/
+.natural-mountain-frames/
+.v642-*
+.relief-v642-world.csv
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.log
+*.tmp
+.env
+.env.*

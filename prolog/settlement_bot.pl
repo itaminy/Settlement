@@ -5,7 +5,9 @@
 :- use_module(settlement_dcg).
 :- use_module(settlement_knowledge, except([resource/3])).
 :- reexport(settlement_strategy, [choose_resource/3]).
-:- use_module(settlement_strategy, [choose_action/3]).
+:- use_module(settlement_strategy, [choose_action/3, choose_decision/5, immediate_danger/0]).
+:- use_module(settlement_strategy_config, [priority/2]).
+:- use_module(settlement_pathfinding, [path_to/2]).
 :- use_module(library(error)).
 :- use_module(library(time)).
 :- use_module(library(uuid)).
@@ -20,7 +22,50 @@ run_bot(Id, Auth, limits(Max, Seconds), Stop, Credentials, Result) :-
     must_be(number, Seconds),
     ( Seconds > 0 -> true ; domain_error(positive_time, Seconds) ),
     with_mutex(settlement_bot,
-               run_session(Id, Auth, Max, Seconds, Stop, Credentials, Result)).
+               setup_call_cleanup(init_pacing,
+                   run_session(Id, Auth, Max, Seconds, Stop, Credentials, Result),
+                   (nb_delete(settlement_pacing), nb_delete(settlement_decision),
+                    nb_delete(settlement_snapshot_summary)))).
+
+delay_setting(Name, Default, Minimum, Seconds) :-
+    ( getenv(Name, Value) ->
+        ( atom_number(Value, Ms), integer(Ms), between(Minimum, 60000, Ms) -> true
+        ; throw(error(domain_error(bot_timing, Name=Value), _))
+        )
+    ; Ms = Default
+    ),
+    Seconds is Ms/1000.
+
+init_pacing :-
+    delay_setting('SETTLEMENT_BOT_MOVE_MS', 350, 1, Move),
+    delay_setting('SETTLEMENT_BOT_ACTION_MS', 700, 700, Action),
+    delay_setting('SETTLEMENT_BOT_BUILD_MS', 2000, 1, Build),
+    delay_setting('SETTLEMENT_BOT_DECISION_MS', 1000, 1, Decision),
+    get_time(Now),
+    nb_setval(settlement_decision, decision(none, starting, 0, wait(0))),
+    nb_setval(settlement_pacing, pacing(Move,Action,Build,Decision,Now,Now,Now,Now,none)).
+
+pace(Session, Kind) :-
+    ( nb_current(settlement_pacing, pacing(_,_,_,_,Move,Action,Build,_,_)) ->
+        get_time(Now),
+        ( Kind == move -> Ready is max(Move, Build)
+        ; Ready is max(Action, Build)
+        ),
+        ( Ready > Now -> wait_action(Session, Ready-Now) ; true )
+    ; true
+    ).
+
+stamp(Kind) :-
+    ( nb_current(settlement_pacing, Clock) ->
+        get_time(Now),
+        ( Kind == move -> arg(1,Clock,Delay), Ready is Now+Delay, nb_setarg(5,Clock,Ready)
+        ; arg(2,Clock,Delay), Ready is Now+Delay, nb_setarg(6,Clock,Ready),
+          ( Kind == build ->
+              arg(3,Clock,Pause), Resume is Now+Pause, nb_setarg(7,Clock,Resume)
+          ; true )
+        )
+    ; true
+    ).
 
 run_session(Id, Auth, Max, Seconds, Stop, Credentials, Result) :-
     reset_knowledge,
@@ -42,20 +87,24 @@ run_connections(Context, Auth, State, Credentials, Reason) :-
     control_time(Deadline, Time),
     with_text_session(Id, Auth, Time, Credentials,
                       connected(Id, Max, Deadline, Stop, Counter, State, Outcome)),
-    ( Outcome = change_connection(Tool, NextState) ->
+    ( Outcome = change_connection(Tool, plan_state(Rejected, Failure, ReadyAt)) ->
         control_time(Deadline, CraftTime),
         with_edn_session(Id, login(Credentials), CraftTime, _,
-                         craft_in_edn(Context, Tool)),
+                         craft_in_edn(Context, Tool, Reply)),
+        ( Reply == ok -> NextRejected = Rejected
+        ; Reply = error(Code), reject_target(retry_seconds, Code, craft(Tool), Rejected, NextRejected) ),
+        NextState = plan_state(NextRejected, Failure, ReadyAt),
         run_connections(Context, login(Credentials), NextState, Credentials, Reason)
     ; Reason = Outcome
     ).
 
-craft_in_edn(run(Id, Max, Deadline, Stop, Counter), Tool, In, Out) :-
+craft_in_edn(run(Id, Max, Deadline, Stop, Counter), Tool, Reply, In, Out) :-
     Session = session(In, Out, Deadline, Stop, Max, Counter, ready),
+    pace(Session, action),
     consume_action(Session),
     remaining_time(Session, Time),
     call_with_time_limit(Time, craft_tool(Id, Tool, In, Out, Reply)),
-    ( Reply == ok -> log('изготовление подтверждено: ~w', [Tool])
+    ( Reply == ok -> stamp(action), log('изготовление подтверждено: ~w', [Tool])
     ; Reply = error(Code), log('изготовление отклонено: ~s', [Code])
     ).
 
@@ -83,19 +132,76 @@ refresh(Session, Id) :-
     ( load_snapshot(reply(1, Reply)), bot_identity(Id, _) ->
         resource_counts(Wood, Stone),
         current_score(Blue, Red),
-        log('снимок v=~d, личный запас: дерево=~d камень=~d, счёт: blue=~d red=~d',
-            [Version, Wood, Stone, Blue, Red])
+        bot_health(HP),
+        log_snapshot(Version, Wood, Stone, Blue, Red, HP)
     ; throw(settlement_error(invalid_bot_snapshot))
     ).
 
+log_snapshot(Version, Wood, Stone, Blue, Red, HP) :-
+    Summary = summary(Wood, Stone, Blue, Red, HP),
+    ( nb_current(settlement_snapshot_summary, Summary) -> true
+    ; nb_setval(settlement_snapshot_summary, Summary),
+      log('снимок v=~d: дерево=~d камень=~d, счёт blue=~d red=~d, HP=~d',
+          [Version, Wood, Stone, Blue, Red, HP]) ).
+
 play(Session, Id, State, Reason) :-
-    State = plan_state(Excluded, _, ReadyAt),
+    State = plan_state(Rejected, Failure, ReadyAt),
     ( match_state(finished, _) -> true ; check_action(Session) ),
     remaining_time(Session, Time),
     get_time(Now),
     Cooldown is max(0, ReadyAt - Now),
-    call_with_time_limit(Time, choose_action(Excluded, Cooldown, Plan)),
-    execute_plan(Plan, Session, Id, State, Reason).
+    active_rejections(Rejected, Now, Active, Excluded),
+    call_with_time_limit(Time, strategic_plan(Session, Excluded, Cooldown, Plan, Unreachable)),
+    foldl(reject_target(no_route_retry_seconds, no_route), Unreachable, Active, NextRejected),
+    ( Plan == stop(no_reachable_resource), nb_current(settlement_pacing, _), NextRejected \== [] ->
+        NextPlan = wait(1)
+    ; NextPlan = Plan ),
+    execute_plan(NextPlan, Session, Id, plan_state(NextRejected, Failure, ReadyAt), Reason).
+
+strategic_plan(Session, Excluded, Cooldown, Plan, Unreachable) :-
+    ( nb_current(settlement_pacing, Clock), match_state(active, _) ->
+        arg(8, Clock, Ready), arg(9, Clock, Target), get_time(Now),
+        ( Now < Ready, Target \== none, \+ memberchk(Target, Excluded),
+          path_to(Target, [Direction|_]),
+          can_continue(Target, Direction) ->
+            Plan = reposition(Direction, Target), Unreachable = []
+        ; ( Now < Ready -> wait_action(Session, Ready-Now) ; true ),
+          nb_current(settlement_decision, Previous),
+          Previous = decision(OldTarget, _, _, _),
+          choose_decision(Excluded, Cooldown, OldTarget, Decision, Unreachable),
+          Decision = decision(_, _, _, Plan),
+          report_decision(Previous, Decision),
+          nb_setval(settlement_decision, Decision),
+          get_time(Decided), arg(4,Clock,Interval), Next is Decided+Interval,
+          nb_setarg(8,Clock,Next),
+          ( Plan = reposition(_, Goal) -> nb_setarg(9,Clock,Goal) ; nb_setarg(9,Clock,none) )
+        )
+    ; choose_action(Excluded, Cooldown, Plan), Unreachable = []
+    ).
+
+can_continue(cell(_, _), Direction) :- !,
+    bot_position(X, Y),
+    settlement_strategy:safe_initial_step(X, Y, [Direction]).
+can_continue(_, _) :- \+ immediate_danger.
+
+report_decision(decision(Old, OldReason, _, _), decision(Target, Reason, Utility, Action)) :-
+    ( Old == Target, OldReason == Reason -> true
+    ; log('стратегия: действие=~q цель=~q полезность=~d причина=~w предыдущая_цель=~q предыдущая_причина=~w',
+          [Action, Target, Utility, Reason, Old, OldReason])
+    ).
+
+active_rejections([], _, [], []).
+active_rejections([rejected(Target, Until)|Rest], Now, Active, Excluded) :-
+    active_rejections(Rest, Now, Tail, Goals),
+    ( Until > Now -> Active = [rejected(Target, Until)|Tail], Excluded = [Target|Goals]
+    ; Active = Tail, Excluded = Goals ).
+
+reject_target(Setting, Cause, Target, Rejected, Next) :-
+    ( memberchk(rejected(Target, _), Rejected) -> Next = Rejected
+    ; priority(Setting, Delay), get_time(Now), Until is Now+Delay,
+      Next = [rejected(Target, Until)|Rejected],
+      log('цель отложена: ~q причина=~w повтор через ~d с', [Target, Cause, Delay])
+    ).
 
 execute_plan(stop(Reason), _, _, _, Reason).
 execute_plan(wait(Seconds), Session, Id, State, Reason) :-
@@ -104,18 +210,25 @@ execute_plan(wait(Seconds), Session, Id, State, Reason) :-
     refresh(Session, Id),
     play(Session, Id, State, Reason).
 execute_plan(craft(Tool), _, _, plan_state(Excluded, _, ReadyAt),
-             change_connection(Tool, plan_state([craft(Tool) | Excluded], none, ReadyAt))).
+             change_connection(Tool, plan_state(Excluded, none, ReadyAt))).
 execute_plan(reposition(Direction, Target), Session, Id,
              plan_state(Excluded, PreviousFailure, ReadyAt), Reason) :-
     movement_command(Direction, Command),
+    pace(Session, move),
     action(Session, Command, Reply),
     ( Reply = ok(move(X, Y)) ->
-        log('шаг ~w подтверждён: (~d, ~d)', [Direction, X, Y]),
+        stamp(move),
+        integer(X), integer(Y),
+        NextExcluded = Excluded,
+        Failure = none
+    ; Reply = error("bot-cooldown", _) ->
+        wait_action(Session, 0.2),
         NextExcluded = Excluded,
         Failure = none
     ; Reply = error(Code, _) ->
         log('отказ движения ~w: ~s, перепланирование', [Direction, Code]),
-        ( PreviousFailure == Target -> NextExcluded = [Target | Excluded]
+        ( PreviousFailure == Target ->
+            reject_target(retry_seconds, Code, Target, Excluded, NextExcluded)
         ; NextExcluded = Excluded
         ),
         Failure = Target
@@ -125,13 +238,22 @@ execute_plan(reposition(Direction, Target), Session, Id,
     play(Session, Id, plan_state(NextExcluded, Failure, ReadyAt), Reason).
 execute_plan(gather(Type, X, Y), Session, Id, plan_state(Excluded, _, ReadyAt), Reason) :-
     Target = gather(Type, X, Y),
+    pace(Session, action),
     gather(Session, Id, Target, Outcome),
+    ( Outcome == gathered -> stamp(action) ; true ),
     refresh(Session, Id),
-    ( Outcome == gathered -> NextExcluded = Excluded ; NextExcluded = [Target | Excluded] ),
+    ( memberchk(Outcome, [gathered, cooldown, interrupted]) -> NextExcluded = Excluded
+    ; reject_target(retry_seconds, Outcome, Target, Excluded, NextExcluded)
+    ),
     play(Session, Id, plan_state(NextExcluded, none, ReadyAt), Reason).
 execute_plan(Target, Session, Id, plan_state(Excluded, _, ReadyAt), Reason) :-
     building_command(Target, Command, Expected),
+    pace(Session, action),
     action(Session, Command, Reply),
+    ( Reply = ok(Expected) ->
+        ( Target = build(_,_,_) -> stamp(build) ; stamp(action) )
+    ; Reply = error("bot-cooldown", _) -> wait_action(Session, 0.2)
+    ; true ),
     building_reply(Target, Expected, Reply, Excluded, NextExcluded, ReadyAt, NextReadyAt),
     refresh(Session, Id),
     play(Session, Id, plan_state(NextExcluded, none, NextReadyAt), Reason).
@@ -146,6 +268,11 @@ building_command(attack(UUID), Command, attack_building(Seq, X, Y, UUID, _, _)) 
     command_sequences(Last, _),
     next_sequence(Last, Seq),
     format(string(Command), 'атакуй постройку на ~d ~d id ~s номер ~d', [X, Y, UUID, Seq]).
+building_command(attack_bandit(UUID), Command, attack_bandit(Seq, X, Y, UUID, _, _)) :-
+    bandit(UUID, X, Y, HP, _, _, _), HP > 0,
+    command_sequences(Last, _),
+    next_sequence(Last, Seq),
+    format(string(Command), 'атакуй бандита на ~d ~d id ~s номер ~d', [X, Y, UUID, Seq]).
 building_command(repair(UUID), Command, repair_building(Seq, X, Y, UUID, _, _)) :-
     building(UUID, X, Y, _, _, _, _, _),
     command_sequences(_, Last),
@@ -154,6 +281,9 @@ building_command(repair(UUID), Command, repair_building(Seq, X, Y, UUID, _, _)) 
 
 building_name(fence, "забор").
 building_name(house, "дом").
+building_name(watchtower, "башню").
+building_name(sawmill, "лесопилку").
+building_name(mine, "шахту").
 
 next_sequence(Last, Seq) :-
     ( Last < 9223372036854775807 -> Seq is Last + 1
@@ -164,15 +294,21 @@ building_reply(Target, Expected, Reply, Excluded, NextExcluded, ReadyAt, NextRea
     ( Reply = ok(Expected) ->
         confirm_building(Expected),
         NextExcluded = Excluded,
-        ( Target = attack(_) -> new_cooldown(NextReadyAt) ; NextReadyAt = ReadyAt )
+        ( attack_target(Target) -> new_cooldown(NextReadyAt) ; NextReadyAt = ReadyAt )
     ; Reply = error(Code, _) ->
         log('действие ~q отклонено: ~s', [Target, Code]),
-        ( Target = attack(_), Code == "attack-cooldown" ->
+        ( attack_target(Target), Code == "attack-cooldown" ->
             new_cooldown(NextReadyAt), NextExcluded = Excluded
-        ; NextReadyAt = ReadyAt, NextExcluded = [Target | Excluded]
+        ; memberchk(Code, ["bot-cooldown","stale-bandit","bandit-not-found","player-downed"]) ->
+            NextReadyAt = ReadyAt, NextExcluded = Excluded
+        ; NextReadyAt = ReadyAt,
+          reject_target(retry_seconds, Code, Target, Excluded, NextExcluded)
         )
     ; throw(settlement_error(unexpected_building_reply))
     ).
+
+attack_target(attack(_)).
+attack_target(attack_bandit(_)).
 
 new_cooldown(ReadyAt) :-
     get_time(Now),
@@ -183,6 +319,8 @@ confirm_building(build(building(UUID, X, Y, Kind, _, _, _, _))) :-
     log('постройка подтверждена: ~s (~d, ~d), UUID ~s', [Kind, X, Y, UUID]).
 confirm_building(attack_building(Seq, X, Y, _, HP, Destroyed)) :-
     log('атака №~d подтверждена: (~d, ~d), HP=~d, уничтожена=~w', [Seq, X, Y, HP, Destroyed]).
+confirm_building(attack_bandit(Seq, X, Y, _, HP, Destroyed)) :-
+    log('атака бандита ~d подтверждена: (~d, ~d), HP=~d, уничтожен=~w', [Seq, X, Y, HP, Destroyed]).
 confirm_building(repair_building(Seq, X, Y, _, HP, Restored)) :-
     Restored > 0, !,
     log('ремонт №~d подтверждён: (~d, ~d), HP=~d (+~d)', [Seq, X, Y, HP, Restored]).
@@ -211,12 +349,17 @@ start_gather(Session, Id, gather(Type, X, Y), State, Outcome) :-
                         progress(Operation, Attempt, Duration, Elapsed), Outcome)
     ; Reply = error(Code, _) ->
         nb_setarg(2, State, disarmed),
-        gather_rejected(Code, Outcome)
+        ( Code == "bot-cooldown" -> wait_action(Session, 0.2), Outcome = cooldown
+        ; gather_rejected(Code, Outcome)
+        )
     ; throw(settlement_error(unexpected_gather_start_reply))
     ).
 
 gather_progress(Session, Id, Target, Material, State, Progress, Outcome) :-
-    ( gathering_player(Id), Target = gather(Type, X, Y),
+    ( nb_current(settlement_pacing, _), immediate_danger ->
+        log('добыча прервана: бандиты рядом', []),
+        Outcome = interrupted
+    ; gathering_player(Id), Target = gather(Type, X, Y),
       settlement_knowledge:resource(X, Y, Type) ->
         Progress = progress(_, _, Duration, Elapsed),
         Left is max(0, Duration - Elapsed),
@@ -253,6 +396,9 @@ finish_gather(Session, Id, Target, Material, State, Progress, Outcome) :-
         log('добыча подтверждена: ~w +~d, цель (~d, ~d)', [Material, Amount, X, Y]),
         Outcome = gathered
     ; Reply = error("too-early", progress(Operation, Attempt, Duration, _)) ->
+        heartbeat(Session, Id, Target, Material, State, Progress, Outcome)
+    ; Reply = error("bot-cooldown", _) ->
+        wait_action(Session, 0.2),
         heartbeat(Session, Id, Target, Material, State, Progress, Outcome)
     ; Reply = error(Code, _) ->
         gather_rejected(Code, Outcome)
@@ -303,7 +449,11 @@ read_reply(In, Reply) :-
         Reply = Payload
     ; Parsed = ok(Event), apply_event(Event) ->
         Event = event(1, Version, _, Changes, Resync),
-        log('событие v=~d: ~q resync=~w', [Version, Changes, Resync]),
+        ( member(Change, Changes),
+          memberchk(Change, ["building-destroyed","player-downed","player-respawned",
+                             "bandit-killed","match-finished","match-started"]) ->
+            log('событие v=~d: ~q resync=~w', [Version, Changes, Resync])
+        ; true ),
         read_reply(In, Reply)
     ; throw(settlement_error(invalid_text_frame))
     ).

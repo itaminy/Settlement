@@ -6,6 +6,7 @@
             [settlement.auth :as auth] [settlement.server :as server]
             [settlement.gui :as gui] [settlement.inventory :as inventory]
             [settlement.inventory-ui :as inventory-ui]
+            [settlement.movement-ui :as movement-ui]
             [settlement.test-support :as support])
   (:import [javax.swing SwingUtilities JProgressBar]
            [java.util.concurrent CountDownLatch TimeUnit]))
@@ -74,6 +75,37 @@
       (is (= 1 @failures)) (is @(:closed queue))
       (is (false? (transport/submit! queue :again {} identity (constantly true) false)))
       (finally (transport/stop! queue)))))
+
+(deftest movement-drops-stale-queued-intent-but-delivers-an-in-flight-confirmation-test
+  (let [blocking (promise) unblock (promise)
+        move-started (promise) allow-reply (promise) applied (promise)
+        drained (promise) calls (atom [])
+        queue (transport/create-queue
+               (fn [message]
+                 (swap! calls conj (:type message))
+                 (case (:type message)
+                   :block (do (deliver blocking true) @unblock {:status :ok})
+                   :move (do (deliver move-started true) @allow-reply
+                             {:status :ok :world {:players {1 {:x 1 :y 0}}}})
+                   {:status :ok})))
+        {:keys [press! release! tick! clear!]}
+        (movement-ui/create-controller {:queue queue} 1 (constantly nil) #(deliver applied %)
+                                       #(quot (System/nanoTime) 1000000))]
+    (try
+      (client/async! {:queue queue} :block {:type :block} identity)
+      (is (true? (deref blocking 5000 false)))
+      (edt! #(do (press! :d :right) (release! :d) (clear!)))
+      (client/async! {:queue queue} :drained {:type :drained} #(deliver drained %))
+      (deliver unblock true)
+      (is (= {:status :ok} (deref drained 5000 :timeout)))
+      (is (= [:block :drained] @calls))
+      (edt! #(press! :d :right))
+      (is (true? (deref move-started 5000 false)))
+      (edt! #(do (release! :d) (tick!)))
+      (deliver allow-reply true)
+      (is (= {:players {1 {:x 1 :y 0}}} (deref applied 5000 :timeout)))
+      (is (= [:block :drained :move] @calls))
+      (finally (deliver unblock true) (deliver allow-reply true) (transport/stop! queue)))))
 
 (defn- with-mining [f]
   (reset! support/time-ns 0)
@@ -188,7 +220,11 @@
          (is (= true (deref succeeded 5000 :timeout)))
          (is (= "Количество: 1" (.getText (get-in ui [:counts :axe]))))
          (is (= "Количество: 0" (.getText (get-in ui [:counts :wood]))))
-         (edt! #(.doClick (get-in ui [:craft-buttons :pickaxe]) 0))
+         (is (not (.isEnabled (get-in ui [:craft-buttons :pickaxe]))))
+         (edt! #(let [button (get-in ui [:craft-buttons :pickaxe])]
+                  ;; Simulate an older, optimistic client inventory at the server boundary.
+                  (.setEnabled button true)
+                  (.doClick button 0)))
          (is (= true (deref rejected 5000 :timeout)))
          (is (every? false? @threads))
          (is (= {:wood 0 :stone 0 :axe 1 :pickaxe 0}

@@ -4,13 +4,15 @@
             [settlement.test-support :as support]
             [settlement.inventory :as inventory]
             [settlement.inventory-ui :as inventory-ui]
+            [settlement.hotbar :as hotbar]
             [settlement.world :as world]
             [settlement.server :as server]
             [settlement.auth :as auth]
             [settlement.client :as client]
             [settlement.gui :as gui])
-  (:import [javax.swing JPanel KeyStroke]
-           [java.awt.event KeyEvent]))
+  (:import [javax.swing JLabel JPanel JProgressBar KeyStroke SwingUtilities]
+           [java.awt.event KeyEvent MouseAdapter MouseEvent MouseWheelEvent]
+           [java.awt.image BufferedImage]))
 
 (use-fixtures :each
   (fn [f]
@@ -25,6 +27,107 @@
 
 (defn- register! [connection id]
   (support/process-message connection {:type :register :player-id id :name (str id)}))
+
+(deftest hotbar-keeps-square-slots-and-input-separate-from-the-map-test
+  (SwingUtilities/invokeAndWait
+   (bound-fn []
+     (let [map-panel (gui/create-map-panel 0 0 7)
+           ui (gui/create-resource-panel {})
+           {:keys [panel selected]} (:hotbar ui)
+           progress (JProgressBar.)
+           status (JLabel. "Status")
+           {:keys [footer] content :panel} (gui/create-game-content map-panel ui progress status)
+           map-clicks (atom 0)]
+       (.addMouseListener map-panel (proxy [MouseAdapter] []
+                                     (mousePressed [_] (swap! map-clicks inc))
+                                     (mouseClicked [_] (swap! map-clicks inc))))
+       (doseq [width [400 800 1920]]
+         (.setSize content width 600)
+         (.doLayout content)
+         (.doLayout footer)
+         (let [slots (hotbar/slot-bounds (.getWidth panel) (.getHeight panel))
+               [left _ size] (first slots) [right _] (last slots)]
+           (is (= 9 (count slots)))
+           (is (every? (fn [[_ _ w h]] (= size w h)) slots))
+           (is (<= (abs (- (+ left right size) width)) 1))
+           (is (= (if (= width 400) 39 56) size))
+           (is (<= (+ (.getY map-panel) (.getHeight map-panel)) (.getY footer)))
+           (is (<= (+ (.getY progress) (.getHeight progress)) (.getY panel)))
+           (is (<= (+ (.getY panel) (.getHeight panel)) (.getY status)))))
+       (doseq [[key expected] [[KeyEvent/VK_9 8] [KeyEvent/VK_NUMPAD2 1]]]
+         (let [action (.get (.getInputMap panel JPanel/WHEN_IN_FOCUSED_WINDOW)
+                            (KeyStroke/getKeyStroke key 0))]
+           (.actionPerformed (.get (.getActionMap panel) action) nil)
+           (is (= expected @selected))))
+       (let [[left top] (nth (hotbar/slot-bounds (.getWidth panel) (.getHeight panel)) 3)
+             press (MouseEvent. panel MouseEvent/MOUSE_PRESSED 0 0 (+ left 4) (+ top 4)
+                                1 false MouseEvent/BUTTON1)]
+         (is (= "Кирка" (.getToolTipText panel press)))
+         (.dispatchEvent panel press)
+         (is (= 3 @selected))
+         (is (.isConsumed press)))
+       (doseq [[target rotation expected] [[panel -4 8] [map-panel 1 0]]]
+         (.dispatchEvent target (MouseWheelEvent. target MouseEvent/MOUSE_WHEEL 0 0 10 10
+                                                  0 false MouseWheelEvent/WHEEL_UNIT_SCROLL 1 rotation))
+         (is (= expected @selected)))
+       (is (zero? @map-clicks))
+       (is (= 5 (.getComponentCount (:panel ui))))))))
+
+(deftest hotbar-follows-gather-craft-build-and-repair-test
+  (SwingUtilities/invokeAndWait
+   (bound-fn []
+     (register! :owner 1)
+     (let [map-panel (gui/create-map-panel 0 0 1)
+           ui (gui/create-resource-panel {})
+           contents (get-in ui [:hotbar :items])
+           request (fn [command] (support/process-message :owner (assoc command :player-id 1)))
+           stock! (fn [expected]
+                    (gui/refresh! map-panel {:writer :owner} ui 1)
+                    (is (= expected (mapv @contents inventory/item-order))))]
+       (with-redefs [client/async! support/immediate-async]
+         (is (= :ok (:status (request {:type :gather}))))
+         (stock! [1 0 0 0])
+         (world/change-player-items! 1 {:wood 5 :stone 2})
+         (is (= :ok (:status (request {:type :craft :tool :axe}))))
+         (stock! [3 0 1 0])
+         (let [position [1 0]
+               built (request {:type :build :building-type :fence :position position})
+               id (get-in built [:building :building-id])]
+           (is (= :ok (:status built)))
+           (stock! [1 0 1 0])
+           (dosync (alter world/world assoc-in [:objects position :hp] 40))
+           (is (= :ok (:status (request {:type :repair-building :position position
+                                        :building-id id :repair-seq 1}))))
+           (stock! [0 0 1 0])))))))
+
+(deftest hotbar-renders-and-refreshes-only-the-local-snapshot-test
+  (SwingUtilities/invokeAndWait
+   (bound-fn []
+     (let [map-panel (gui/create-map-panel 0 0 1)
+           ui (gui/create-resource-panel {})
+           {:keys [panel items selected]} (:hotbar ui)
+           local-stock {:wood 12 :stone 7 :axe 1 :pickaxe 1}
+           snapshot (atom {:players {1 {:x 0 :y 0 :inventory {:items local-stock}}
+                                     2 {:x 1 :y 0 :inventory {:items {:wood 999 :stone 999}}}}
+                           :objects {} :resources {:wood 9999 :stone 9999}})
+           paint (fn []
+                   (let [target (BufferedImage. 552 72 BufferedImage/TYPE_INT_ARGB)
+                         graphics (.createGraphics target)]
+                     (try (.paint panel graphics) (finally (.dispose graphics)))
+                     target))
+           pixels (fn [^BufferedImage image [x y w h]] (vec (.getRGB image x y w h nil 0 w)))]
+       (.setSize panel 552 72)
+       (let [empty (paint)]
+         (with-redefs [client/async! (fn [_ _ _ callback] (callback {:status :ok :world @snapshot}))]
+           (gui/refresh! map-panel {} ui 1)
+           (is (= local-stock @items))
+           (let [full (paint)]
+             (doseq [[index bounds] (map-indexed vector (hotbar/slot-bounds 552 72))]
+               (is (= (< index 4) (not= (pixels empty bounds) (pixels full bounds))))))
+           (swap! snapshot assoc-in [:players 1 :inventory :items] {:wood 0 :stone 6 :axe 1 :pickaxe 0})
+           (gui/refresh! map-panel {} ui 1)
+           (is (= {:wood 0 :stone 6 :axe 1 :pickaxe 0} @items))
+           (is (= 0 @selected))))))))
 
 (deftest empty-inventory-test
   (register! :a 1)
@@ -124,7 +227,7 @@
        (is (= "Количество: 1" (.getText (get-in ui [:counts :wood]))))
        (is (= "Количество: 0" (.getText (get-in ui [:counts :axe]))))
        (is (= "Свободно слотов: 11 / 12" (.getText (:free-label ui))))
-       (is (= "Моё дерево: 1" (.getText (:wood-label resource-ui))))))))
+       (is (= 1 (:wood @(get-in resource-ui [:hotbar :items]))))))))
 
 (deftest inventory-key-toggle-test
   (let [panel (JPanel.) visible (atom false)]

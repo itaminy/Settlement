@@ -5,7 +5,7 @@
 :- use_module(library(ordsets)).
 :- use_module(settlement_knowledge,
               [bot_identity/2, player/5, world_size/2, match_state/2,
-               obstacle/3, building/8, known_resource/3]).
+               obstacle/3, building/8, known_resource/3, bandit/7, downed/1, reserved/2]).
 
 % Plan against the terrain with every known resource restored. Players
 % occupy movement cells but do not block the server's connectivity search.
@@ -20,6 +20,7 @@ construction_terrain(terrain(Map, Resources)) :-
 
 preserves_access(terrain(Map, Resources), build(Kind, X, Y)) :-
     footprint(Kind, X, Y, Cells),
+    \+ (member(cell(CX, CY), Cells), reserved(CX, CY)),
     maplist(walkable(Map), Cells),
     Map = map(Width, Height, Occupied),
     foldl(block_cell, Cells, Occupied, WithBuilding),
@@ -78,6 +79,7 @@ path_to(Target, Route) :-
 plan(Target, Start, Map, Goals) :-
     match_state(active, _),
     bot_identity(Id, Team),
+    \+ downed(Id),
     player(Id, X, Y, Team, _),
     Start = cell(X, Y),
     world_size(Width, Height),
@@ -90,7 +92,8 @@ plan(Target, Start, Map, Goals) :-
     Goals = [_ | _].
 
 blocked_cell(_, cell(X, Y)) :- settlement_knowledge:resource(X, Y, _).
-blocked_cell(Self, cell(X, Y)) :- player(Id, X, Y, _, _), Id \== Self.
+blocked_cell(Self, cell(X, Y)) :- player(Id, X, Y, _, _), Id \== Self, \+ downed(Id).
+blocked_cell(_, cell(X, Y)) :- bandit(_, X, Y, HP, _, _, _), HP > 0.
 blocked_cell(_, Cell) :- structure_cell(Cell).
 
 structure_cell(cell(X, Y)) :- obstacle(X, Y, _).
@@ -115,6 +118,9 @@ target_cells(attack(UUID), Team, _, Goals) :-
     Enemy \== Team,
     footprint(Kind, X, Y, Cells),
     interaction_cells(Cells, 1, Goals).
+target_cells(attack_bandit(UUID), _, _, Goals) :-
+    bandit(UUID, X, Y, HP, _, _, _), HP > 0,
+    interaction_cells([cell(X, Y)], 1, Goals).
 target_cells(repair(UUID), Team, _, Goals) :-
     string(UUID),
     building(UUID, X, Y, Kind, Team, _, _, _),
@@ -124,15 +130,17 @@ target_cells(repair(UUID), Team, _, Goals) :-
 footprint(Kind, X, Y, Cells) :-
     % DCG stores building kinds as strings. The public build target uses atoms.
     integer(X), integer(Y),
-    building_extent(Kind, Extent),
-    MaxX is X + Extent - 1,
-    MaxY is Y + Extent - 1,
+    ( string(Kind) -> atom_string(Type, Kind) ; Type = Kind ),
+    building_extent(Type, Width, Height),
+    MaxX is X + Width - 1,
+    MaxY is Y + Height - 1,
     findall(cell(CX, CY), (between(X, MaxX, CX), between(Y, MaxY, CY)), Cells).
 
-building_extent(fence, 1).
-building_extent(house, 2).
-building_extent("fence", 1).
-building_extent("house", 2).
+building_extent(fence, 1, 1).
+building_extent(house, 2, 2).
+building_extent(watchtower, 2, 1).
+building_extent(sawmill, 2, 2).
+building_extent(mine, 2, 1).
 
 interaction_cells(Footprint, Radius, Cells) :-
     MinOffset is -Radius,
@@ -198,10 +206,12 @@ relax(Previous, Cost, Goals, Direction-Cell,
       put_assoc(Cell, Visited, node(Cost, Previous, Direction), NextVisited)
     ).
 
-heuristic(cell(X, Y), Goals, H) :-
-    findall(D, (member(cell(GX, GY), Goals), D is abs(GX - X) + abs(GY - Y)),
-            Distances),
-    min_list(Distances, H).
+heuristic(cell(X, Y), [cell(GX, GY) | Goals], H) :-
+    First is abs(GX - X) + abs(GY - Y),
+    foldl(nearer_goal(X, Y), Goals, First, H).
+
+nearer_goal(X, Y, cell(GX, GY), Best, Distance) :-
+    Distance is min(Best, abs(GX - X) + abs(GY - Y)).
 
 restore_route(Cell, Visited, Tail, Route) :-
     get_assoc(Cell, Visited, node(Cost, Previous, Direction)),

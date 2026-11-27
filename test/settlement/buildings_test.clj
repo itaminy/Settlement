@@ -8,6 +8,7 @@
             [settlement.client :as client]
             [settlement.transport :as transport]
             [settlement.layout :as layout]
+            [settlement.config :as config]
             [settlement.rendering :as rendering]
             [settlement.gui :as gui]
             [settlement.test-support :as support])
@@ -18,7 +19,8 @@
 
 (use-fixtures :each
   (fn [f]
-    (with-redefs [world/world (ref {:players {} :objects {} :resources {:wood 0 :stone 0}
+    (with-redefs [config/bot-timing-ms {:move 0 :action 0 :after-build 0}
+                  world/world (ref {:players {} :objects {} :resources {:wood 0 :stone 0}
                                    :match world/initial-match})
                   world/gathering (ref {}) auth/state (ref (auth/new-state))
                   layout/spawn-position [0 0] layout/spawn-cells support/row-major-spawn
@@ -26,7 +28,8 @@
       (f))))
 
 (defn- player! [id position stock]
-  (server/process-message id {:type :register :player-id id :name (str id)})
+  (server/process-message id {:type :register :player-id id :name (str id)
+                              :client-kind (if (even? id) :prolog :human)})
   (let [[x y] position] (dosync (alter world/world update-in [:players id] assoc :x x :y y)))
   (world/change-player-items! id stock))
 (defn- build! [id kind position]
@@ -49,9 +52,9 @@
 (deftest fence-and-house-costs-test
   (player! 1 [10 10] {:wood 30 :stone 20})
   (is (= :ok (:status (build! 1 :fence [10 11]))))
-  (is (= {:blue 2 :red 0} (get-in (world/get-world) [:match :scores])))
+  (is (= {:blue 0 :red 0} (get-in (world/get-world) [:match :scores])))
   (is (= :ok (:status (build! 1 :house [11 10]))))
-  (is (= {:scores {:blue 17 :red 0} :phase :active :winner nil} (:match (world/get-world))))
+  (is (= {:scores {:blue 15 :red 0} :phase :active :winner nil} (:match (world/get-world))))
   (is (= {:wood 13 :stone 10 :axe 0 :pickaxe 0} (items 1)))
   (let [objects (:objects (world/get-world))
         fence (objects [10 11])
@@ -85,7 +88,7 @@
 (deftest rejected-builds-never-charge-test
   (player! 1 [10 10] {:wood 50 :stone 50})
   (doseq [[kind position code] [[:unknown [11 10] :unknown-building]
-                                 [:house [49 49] :out-of-bounds] [:fence [-1 10] :out-of-bounds]
+                                 [:house [(dec config/world-width) (dec config/world-height)] :out-of-bounds] [:fence [-1 10] :out-of-bounds]
                                  [:house [12 13] :too-far] [:fence [12 11] :too-far]
                                  [:fence [10 10] :player-blocked] [:house [10 10] :player-blocked]
                                  [:house [11] :invalid-position] [:fence [1.5 1] :invalid-position]]]
@@ -214,7 +217,7 @@
 
 (deftest attack-cooldown-and-replay-survive-reconnect-test
   (player! 1 [10 10] {:wood 4})
-  (let [registered (server/process-message 2 {:type :register :player-id 2 :name "Red"})
+  (let [registered (server/process-message 2 {:type :register :player-id 2 :name "Red" :client-kind :prolog})
         a (get-in (build! 1 :fence [11 10]) [:building :building-id])
         b (get-in (build! 1 :fence [10 11]) [:building :building-id])
         first-hit (attack-command 2 [11 10] a 1)
@@ -303,20 +306,21 @@
   (player! 3 [13 11] {:wood 2})
   (let [anchor [11 10]
         id (get-in (build! 1 :house anchor) [:building :building-id])
-        repair #(repair-command 3 [12 11] id %)]
-    (dosync (alter world/world assoc-in [:objects anchor :hp] 186))
-    (let [result (server/process-message 3 (assoc (repair 1)
+        repair #(repair-command 1 [12 11] id %)]
+    (dosync (alter world/world assoc-in [:objects anchor :hp] 186)
+            (alter world/world update-in [:players 1] assoc :x 13 :y 10))
+    (let [result (server/process-message 1 (assoc (repair 1)
                                                  :cost {:wood 0} :hp 999 :restored-hp 999
                                                  :team :red :owner-id 3 :max-hp 999))]
       (is (= {:status :ok :hp 196 :restored-hp 10 :anchor anchor :building-id id}
              (dissoc result :world)))
-      (is (= 1 (:wood (items 3))))
-      (is (= 2 (:wood (items 1)))))
-    (let [result (server/process-message 3 (repair 2))]
+      (is (= 1 (:wood (items 1))))
+      (is (= 2 (:wood (items 3)))))
+    (let [result (server/process-message 1 (repair 2))]
       (is (= {:hp 200 :restored-hp 4} (select-keys result [:hp :restored-hp])))
-      (is (zero? (:wood (items 3)))))
+      (is (zero? (:wood (items 1)))))
     (let [state (world/get-world)]
-      (is (= :building-at-full-hp (:code (server/process-message 3 (repair 3)))))
+      (is (= :building-at-full-hp (:code (server/process-message 1 (repair 3)))))
       (is (= state (world/get-world)))
       (is (= {:blue 15 :red 0} (get-in state [:match :scores]))))))
 
@@ -378,7 +382,7 @@
     (is (= 1 (:wood (items 1))))
     (let [results (race [#(request 1 2) #(request 3 1)])]
       (is (= {:ok 1 :error 1} (frequencies (map :status results))))
-      (is (= [:building-at-full-hp] (keep :code results)))
+      (is (= [:not-building-owner] (keep :code results)))
       (is (= 50 (get-in (world/get-world) [:objects anchor :hp])))
       (is (= 2 (+ (:wood (items 1)) (:wood (items 3))))))))
 
@@ -402,7 +406,7 @@
         (do
           (is (= 20 (:hp repaired)))
           (is (= 10 (get-in state [:objects anchor :hp])))
-          (is (= {:blue 2 :red 0} (get-in state [:match :scores])))
+          (is (= {:blue 0 :red 0} (get-in state [:match :scores])))
           (is (zero? (:wood (items 1)))))))))
 
 (deftest repair-and-construction-cannot-overspend-wood-test
@@ -418,58 +422,58 @@
       (is (= [:insufficient-items] (keep :code results)))
       (is (= (if repaired? 1 0) (:wood (items 1))))
       (is (= (if repaired? 30 20) (get-in state [:objects anchor :hp])))
-      (is (= (if repaired? 2 4) (get-in state [:match :scores :blue]))))))
+      (is (= 0 (get-in state [:match :scores :blue]))))))
 
-(defn- put-legacy-fences! [teams]
+(defn- put-scoring-structures! [teams]
   (dosync
     (alter world/world update :objects into
            (map-indexed (fn [index team]
-                          [[(+ 1 (mod index 25)) (+ 20 (* 3 (quot index 25)))]
-                           {:type :building :kind :fence :team team}])
+                          [[(+ 1 (* 3 index)) 20]
+                           {:type :building :kind :sawmill :team team}])
                         teams)))
   (world/migrate-teams!))
 
 (deftest concurrent-winning-builds-test
-  (player! 1 [10 10] {:wood 2})
-  (player! 2 [15 10] {:wood 2})
-  (put-legacy-fences! (concat (repeat 49 :blue) (repeat 49 :red)))
-  (is (= {:scores {:blue 98 :red 98} :phase :active :winner nil} (:match (world/get-world))))
-  (let [results (race [#(build! 1 :fence [11 10]) #(build! 2 :fence [16 10])])
+  (player! 1 [10 10] {:wood 20 :stone 10})
+  (player! 2 [15 10] {:wood 20 :stone 10})
+  (put-scoring-structures! (concat (repeat 4 :blue) (repeat 4 :red)))
+  (is (= {:scores {:blue 80 :red 80} :phase :active :winner nil} (:match (world/get-world))))
+  (let [results (race [#(build! 1 :sawmill [11 10]) #(build! 2 :sawmill [16 10])])
         winner (if (= :ok (:status (first results))) :blue :red)
         loser ({:blue :red :red :blue} winner)
         state (world/get-world)]
     (is (= {:ok 1 :error 1} (frequencies (map :status results))))
     (is (= :match-finished (:code (first (filter :code results)))))
-    (is (= {:scores {winner 100 loser 98} :phase :finished :winner winner} (:match state)))
+    (is (= {:scores {winner 100 loser 80} :phase :finished :winner winner} (:match state)))
     (is (= (:match state) (get-in (first (filter :building results)) [:world :match])))
-    (is (= 99 (count (:objects state))))
-    (is (= [0 2] (sort [(:wood (items 1)) (:wood (items 2))])))))
+    (is (= 9 (count (:objects state))))
+    (is (= [0 20] (sort [(:wood (items 1)) (:wood (items 2))])))))
 
 (deftest match-migration-recalculates-without-duplicating-points-test
   (dosync (alter world/world dissoc :match))
   (dosync (alter world/world assoc-in [:objects [12 11]] :house)
           (alter world/world assoc-in [:objects [14 12]] {:type :building :kind :house :owner-id 99})
           (alter world/world assoc-in [:objects [16 12]] {:type :building :kind :house :team :red}))
-  (put-legacy-fences! (concat (repeat 50 :blue) (repeat 50 :red)))
+  (put-scoring-structures! (concat (repeat 5 :blue) (repeat 5 :red)))
   (let [state (world/get-world)]
     (is (= {:scores {:blue 100 :red 115} :phase :finished :winner :red} (:match state)))
     (world/migrate-teams!)
     (is (= state (world/get-world)))
     ;; Emulate removing one building to verify that the score can be rebuilt.
-    (dosync (alter world/world update :objects dissoc [16 12] [1 20] [1 26] [2 26]))
+    (dosync (alter world/world update :objects dissoc [16 12] [1 20] [16 20] [19 20]))
     (world/migrate-teams!)
-    (is (= {:scores {:blue 98 :red 96} :phase :finished :winner :red} (:match (world/get-world))))))
+    (is (= {:scores {:blue 80 :red 60} :phase :finished :winner :red} (:match (world/get-world))))))
 
 (deftest completed-match-blocks-gameplay-test
   (player! 1 [10 10] {:wood 20 :stone 10})
-  (let [registration (server/process-message 2 {:type :register :player-id 2 :name "Red"})]
+  (let [registration (server/process-message 2 {:type :register :player-id 2 :name "Red" :client-kind :prolog})]
     (dosync (alter world/world update-in [:players 2] assoc :x 15 :y 10)
             (alter world/world assoc-in [:objects [15 9]] :tree))
-    (put-legacy-fences! (repeat 49 :blue))
+    (put-scoring-structures! (repeat 4 :blue))
     (let [start (server/process-message 2 {:type :gather-start :player-id 2 :attempt-id "active"})
           operation-id (:operation-id start)]
       (is (= :ok (:status start)))
-      (is (= :ok (:status (build! 1 :fence [11 10]))))
+      (is (= :ok (:status (build! 1 :sawmill [11 10]))))
       (is (empty? @world/gathering))
       (let [state (world/get-world)]
         (let [id (get-in state [:objects [11 10] :building-id])
@@ -555,7 +559,13 @@
     (is (= [20 15] (building-ui/screen-to-cell camera 800 600 112 192)))
     (is (= [20 15] (building-ui/screen-to-cell camera 1000 800 212 292)))
     (is (nil? (building-ui/screen-to-cell camera 1000 800 20 20)))
-    (is (nil? (building-ui/screen-to-cell camera 800 600 800 100)))))
+    (is (nil? (building-ui/screen-to-cell camera 800 600 800 100))))
+  (let [camera {:x 1215.25 :y 831.25 :width 800 :height 600}]
+    (is (= [18 12] (building-ui/screen-to-cell camera 800 600 0 0)))
+    (is (= [19 13] (building-ui/screen-to-cell camera 800 600 1 1)))
+    (is (= [18 12] (building-ui/screen-to-cell camera 1000 800 100 100)))
+    (is (= [19 13] (building-ui/screen-to-cell (assoc camera :x 1215.75 :y 831.5)
+                                              800 600 0 0)))))
 
 (deftest built-house-renders-once-test
   (let [entry {:type :building :kind :house :owner-id 1}
@@ -583,8 +593,9 @@
                       (reset! displayed world)
                       (gui/update-map panel (:players world) (:objects world)))
            pending (atom [])
-           camera (rendering/camera player 800 600)
-           point (fn [[x y]] [(- (+ (* x 64) 32) (:x camera)) (- (+ (* y 64) 32) (:y camera))])
+           camera (-> (rendering/camera player 800 600) (update :x + 40.5) (update :y + 12.25))
+           point (fn [[x y]] [(int (- (+ (* x 64) 32) (:x camera)))
+                             (int (- (+ (* y 64) 32) (:y camera)))])
            event (fn [cell type button]
                    (let [[x y] (point cell)]
                      (java.awt.event.MouseEvent. panel type 0 0 x y 1 false button)))
@@ -599,6 +610,7 @@
                     (let [[_ callback] (peek @pending)] (callback response)))]
        (.setSize panel 800 600)
        (applied! snapshot)
+       (.putClientProperty panel :settlement.gui/camera camera)
        (with-redefs [client/async! (fn [_ _ message callback] (swap! pending conj [message callback]) true)]
          (let [controller (building-ui/install! panel {} player-id label applied! (fn [])
                                                 {:attack-seq 8 :repair-seq 4})]
@@ -731,13 +743,13 @@
       (try
         (let [a (open!) b (open!)]
           (doseq [[connection id position] [[a 1 [10 10]] [b 2 [12 10]]]]
-            (is (= :ok (:status (client/request connection {:type :register :player-id id :name (str id)}))))
+            (is (= :ok (:status (client/request connection {:type :register :player-id id :name (str id) :client-kind (if (= id 2) :prolog :human)}))))
             (dosync (alter world/world update-in [:players id] assoc :x (first position) :y (second position)))
             (world/change-player-items! id {:wood 10}))
           (is (= :ok (:status (client/request a {:type :build :player-id 1 :building-type :fence :position [11 10]}))))
           (let [state (:world (client/request b {:type :state}))]
             (is (= state (:world (client/request a {:type :state}))))
-            (is (= {:blue 2 :red 0} (get-in state [:match :scores])))
+            (is (= {:blue 0 :red 0} (get-in state [:match :scores])))
             (is (= [:blue :red] (mapv #(get-in state [:players % :team]) [1 2])))
             (let [building (get-in state [:objects [11 10]])]
               (is (uuid? (:building-id building)))
@@ -782,6 +794,132 @@
     (is (every? #(= fence %) (vals objects)))))
 
 (def production-protected-cells buildings/protected-cells)
+
+(deftest new-structures-retain-damage-and-lose-points-only-on-destruction-test
+  (doseq [[kind cost hp points size] [[:watchtower {:wood 10 :stone 8} 150 10 [2 1]]
+                                      [:sawmill {:wood 20 :stone 10} 240 20 [2 2]]
+                                      [:mine {:wood 10 :stone 20} 260 20 [2 1]]]]
+    (testing (name kind)
+      (with-redefs [world/world (ref {:players {} :objects {[24 24] :sawmill}
+                                     :resources {:wood 0 :stone 0} :match world/initial-match})
+                    auth/state (ref (auth/new-state))]
+        (let [registration (server/process-message 1 {:type :register :client-kind :human
+                                                       :player-id 1 :name "Owner"})
+              anchor [11 10]
+              clock (atom 0)]
+          (dosync (alter world/world update-in [:players 1] assoc :x 10 :y 10))
+          (world/change-player-items! 1 (update cost :wood inc))
+          (player! 2 [13 10] {})
+          (let [result (build! 1 kind anchor)
+                entry (:building result)
+                uuid (:building-id entry)
+                placement (rendering/building-placement anchor entry)]
+            (is (= :ok (:status result)))
+            (is (= [hp hp] ((juxt :hp :max-hp) entry)))
+            (is (= kind (:kind placement)))
+            (is (= (* (first size) (second size)) (count (buildings/cells anchor entry))))
+            (is (every? #(not (world/free-cell? (world/get-world) %)) (buildings/cells anchor entry)))
+            (is (= {:wood 1 :stone 0 :axe 0 :pickaxe 0} (items 1)))
+            (is (= points (get-in (world/get-world) [:match :scores :blue])))
+            (with-redefs [world/now-ns #(deref clock)]
+              (is (= (- hp 10) (:hp (server/process-message 2 (attack-command 2 anchor uuid 1)))))
+              (dotimes [_ 3]
+                (rendering/render-scene {} (:objects (world/get-world))
+                                        (rendering/camera {:x 11 :y 10} 320 240)))
+              (world/migrate-building-durability!)
+              (auth/disconnect! 1)
+              (is (= :ok (:status (server/process-message :owner
+                                     (assoc (select-keys registration [:token :server-instance])
+                                            :type :login :player-id 1)))))
+              (let [snapshot (server/process-message :owner {:type :state})]
+                (is (= (- hp 10) (get-in snapshot [:world :objects anchor :hp])))
+                (is (= points (get-in snapshot [:world :match :scores :blue]))))
+              (let [repair (repair-command 1 anchor uuid 1)
+                    repaired (server/process-message :owner repair)]
+                (is (= hp (:hp repaired)))
+                (is (= repaired (server/process-message :owner repair)))
+                (is (zero? (:wood (items 1)))))
+              (doseq [sequence (range 2 (+ 2 (quot hp 10)))]
+                (swap! clock + 1000000000)
+                (is (= :ok (:status (server/process-message 2
+                                       (attack-command 2 anchor uuid sequence))))))
+              (is (nil? (get-in (world/get-world) [:objects anchor])))
+              (is (zero? (get-in (world/get-world) [:match :scores :blue])))
+              (is (= :invalid-resource (world/restore-resource anchor entry)))
+              (is (= :building-not-found (:code (server/process-message :owner
+                                                  (repair-command 1 anchor uuid 2)))))
+              (is (nil? (get-in (world/get-world) [:objects anchor]))))))))))
+
+(deftest bot-cooldowns-apply-to-raw-tcp-and-survive-login-test
+  (let [clock (atom 0)
+        clients (atom [])]
+    (with-redefs [world/now-ns #(deref clock)
+                  config/bot-timing-ms {:move 350 :action 700 :after-build 2000}]
+      (with-open [listener (ServerSocket. 0)]
+        (letfn [(connect! []
+                  (let [socket (doto (Socket. "127.0.0.1" (.getLocalPort listener)) (.setSoTimeout 5000))
+                        handler (future (server/handle-client (.accept listener)))
+                        connection {:socket socket
+                                    :reader (java.io.BufferedReader. (java.io.InputStreamReader.
+                                                                      (.getInputStream socket) "UTF-8"))
+                                    :writer (java.io.BufferedWriter. (java.io.OutputStreamWriter.
+                                                                      (.getOutputStream socket) "UTF-8"))}]
+                    (swap! clients conj [connection handler])
+                    [connection handler]))
+                (advance! [ms] (swap! clock + (* ms 1000000)))]
+          (try
+            (let [[bot bot-handler] (connect!)
+                  [human _] (connect!)
+                  registration (client/request bot {:type :register :client-kind :prolog :player-id 2 :name "Bot"})
+                  move {:type :move :player-id 2 :direction :right}
+                  axe {:type :craft :player-id 2 :tool :axe}
+                  pickaxe (assoc axe :tool :pickaxe)
+                  build {:type :build :player-id 2 :building-type :watchtower :position [12 11]}]
+              (is (= :ok (:status registration)))
+              (is (= :ok (:status (client/request human {:type :register :player-id 1 :name "Human"}))))
+              (dosync (alter world/world update-in [:players 2] assoc :x 10 :y 10))
+              (world/change-player-items! 2 {:wood 15 :stone 13})
+              (is (= :ok (:status (client/request bot move))))
+              (advance! 349)
+              (is (= :bot-cooldown (:code (client/request bot move))))
+              (advance! 1)
+              (is (= :ok (:status (client/request bot move))))
+              (is (= :ok (:status (client/request bot axe))))
+              (advance! 699)
+              (is (= :bot-cooldown (:code (client/request bot pickaxe))))
+              (advance! 1)
+              (is (= :ok (:status (client/request bot pickaxe))))
+              (is (= :bot-cooldown (:code (client/request bot build))))
+              (advance! 700)
+              (is (= :ok (:status (client/request bot build))))
+              (client/close-connection bot)
+              (deref bot-handler 5000 nil)
+              (let [[reconnected _] (connect!)
+                    login (assoc (select-keys registration [:token :server-instance])
+                                 :type :login :player-id 2)]
+                (is (= :ok (:status (client/request reconnected login))))
+                (advance! 1999)
+                (is (= :bot-cooldown (:code (client/request reconnected move))))
+                (dotimes [_ 2]
+                  (is (= :ok (:status (client/request human (assoc move :player-id 1))))))
+                (advance! 1)
+                (is (= :ok (:status (client/request reconnected move))))
+                (let [anchor (:position build)
+                      id (get-in (world/get-world) [:objects anchor :building-id])
+                      repair (repair-command 2 anchor id 1)]
+                  (dosync (alter world/world assoc-in [:objects anchor :hp] 140))
+                  (world/change-player-items! 2 {:wood 1})
+                  (let [result (client/request reconnected repair)]
+                    (is (= 150 (:hp result)))
+                    (is (= result (client/request reconnected repair)))
+                    (is (= :bot-cooldown (:code (client/request reconnected (assoc repair :repair-seq 2)))))
+                    (is (zero? (:wood (items 2))))))))
+            (finally
+              (doseq [[connection handler] @clients]
+                (client/close-connection connection)
+                (deref handler 5000 nil)
+                (future-cancel handler)))))))))
+
 (deftest build-on-production-map-preserves-settlement-and-access-test
   (player! 1 [24 29] {:wood 15 :stone 10})
   (dosync (alter world/world assoc :objects layout/initial-objects))

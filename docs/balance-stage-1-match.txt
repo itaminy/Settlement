@@ -1,0 +1,17 @@
+Settlement stage 1 autonomous match
+Default pacing: move=350 ms, action=700 ms, after build=2000 ms, decision=1000 ms
+Map: 100 x 100. Red: SWI-Prolog bot. Blue: no active player
+Elapsed: 496.06 s
+Command attempts (including gathering heartbeats): 1349
+Result: finished, red wins 100:0
+
+Confirmed builds and anchor cells, in order
+1. house (52, 20)
+2. watchtower (44, 20)
+3. sawmill (40, 21)
+4. mine (32, 21)
+5. sawmill (45, 21)
+6. house (33, 16)
+
+Totals: house=2, watchtower=1, sawmill=2, mine=1, fence=0
+Reproduce: clojure -M scripts/check_world_v3.clj match

@@ -147,7 +147,7 @@
     (try
       (deliver start true)
       (is (every? #(= :ok (:status (deref % 5000 {}))) tasks))
-      (is (= {:blue 1 :red 1}
+      (is (= {:blue 2}
              (frequencies (map :team (vals (:players (world/get-world)))))))
       (is (= #{[0 0] [2 0]}
              (set (map (juxt :x :y) (vals (:players (world/get-world)))))))
@@ -164,7 +164,7 @@
   (let [registration (register :a 1)]
     (auth/disconnect! :a)
     (register :b 2)
-    (is (= :red (get-in (world/get-world) [:players 2 :team])))
+    (is (= :blue (get-in (world/get-world) [:players 2 :team])))
     (is (= :ok (:status (server/process-message :c {:type :register :player-id 3
                                                    :name "Player 3" :team :red}))))
     (is (= :blue (get-in (world/get-world) [:players 3 :team])))
@@ -249,14 +249,16 @@
     (with-redefs [client/async! support/immediate-async]
       (support/process-message :a {:type :gather :player-id 1})
       (gui/update-player-panels! resource-ui (world/get-world) 1)
-      (gui/bind-key panel {} 1 java.awt.event.KeyEvent/VK_RIGHT :right)
+      (gui/bind-movement! panel {} resource-ui 1)
       (is (= {:wood 1 :stone 0} (get-in (world/get-world) [:players 1 :collected])))
       (is (nil? (get-in (world/get-world) [:objects [1 0]])))
-      (.actionPerformed (.get (.getActionMap panel) "move-right") nil)
+      (let [stroke (javax.swing.KeyStroke/getKeyStroke java.awt.event.KeyEvent/VK_RIGHT 0)
+            action (.get (.getInputMap panel javax.swing.JPanel/WHEN_IN_FOCUSED_WINDOW) stroke)]
+        (.actionPerformed (.get (.getActionMap panel) action) nil))
       (is (= 1 (get-in (world/get-world) [:players 1 :x]))))))
 
-(defn- panel-text [ui]
-  (str/join " | " (map #(.getText (ui %)) [:wood-label :stone-label])))
+(defn- hotbar-resources [ui]
+  (select-keys @(get-in ui [:hotbar :items]) [:wood :stone]))
 
 (deftest score-panel-follows-server-state-test
   (javax.swing.SwingUtilities/invokeAndWait
@@ -274,20 +276,22 @@
                                      (callback @response))]
          (gui/refresh! map-panel {} ui 1)
          (is (= ["Синие: 17" "Красные: 30" "Цель: 100"] (labels)))
-         (is (= "Моё дерево: 7 | Мой камень: 4" (panel-text ui)))
+         (is (= {:wood 7 :stone 4} (hotbar-resources ui)))
          (swap! response assoc-in [:world :match :scores :red] 45)
          (gui/refresh! map-panel {} ui 1)
          (is (= ["Синие: 17" "Красные: 45" "Цель: 100"] (labels))))))))
 
-(deftest finished-match-notifies-once-and-keeps-map-test
+(deftest finished-match-overlay-and-restart-test
   (javax.swing.SwingUtilities/invokeAndWait
    (fn []
-     (doseq [[winner message] [[:blue "Победила синяя команда!"]
-                              [:red "Победила красная команда!"]]]
+     (doseq [[winner title message] [[:blue "Победа!" "Победили синие"]
+                                    [:red "Поражение!" "Победили красные"]]]
        (let [map-panel (gui/create-map-panel 0 0 1)
-             messages (atom [])
-             ui (assoc (gui/create-resource-panel {}) :show-victory! #(swap! messages conj %))
-             active {:players {1 {:x 0 :y 0}}
+             screen (gui/create-match-screen map-panel)
+             gameplay (atom [])
+             ui (assoc (gui/create-resource-panel {}) :match-view (atom nil)
+                       :match-id (atom 0) :match-screen screen :set-gameplay! #(swap! gameplay conj %))
+             active {:players {1 {:x 0 :y 0 :team :blue}}
                      :objects {}
                      :match {:scores {:blue 98 :red 98} :phase :active}}
              finished (-> active
@@ -295,17 +299,72 @@
                           (assoc-in [:match :scores winner] 100)
                           (assoc-in [:match :phase] :finished)
                           (assoc-in [:match :winner] winner))
-             response (atom active)]
-         (with-redefs [client/async! (fn [_ _ _ callback] (callback {:status :ok :world @response}))]
+             response (atom active)
+             requests (atom [])
+             restarted (assoc active :match-id 1 :match world/initial-match)]
+         (with-redefs [client/async! (fn [_ _ request callback]
+                                       (swap! requests conj request)
+                                       (callback {:status :ok :world (if (= :restart-match (:type request))
+                                                                      restarted @response)}))]
+           (#'gui/bind-restart! screen {} map-panel ui 1)
            (gui/refresh! map-panel {} ui 1)
-           (is (empty? @messages))
+           (is (not (.isVisible (:panel screen))))
            (reset! response finished)
            (dotimes [_ 3] (gui/refresh! map-panel {} ui 1))
-           (is (= [message] @messages))
+           (is (.isVisible (:panel screen)))
+           (.setSize map-panel 800 480)
+           (.doLayout map-panel)
+           (is (= [800 480] [(.getWidth (:panel screen)) (.getHeight (:panel screen))]))
+           (is (= [true false] @gameplay))
+           (is (= 1 (.getComponentCount map-panel)))
+           (is (= title (.getText (:title screen))))
+           (is (= message (.getText (:winner screen))))
+           (is (= (str "Синие: " (get-in finished [:match :scores :blue])
+                       "    Красные: " (get-in finished [:match :scores :red]))
+                  (.getText (:score screen))))
+           (is (= "Новая игра" (.getText (:button screen))))
            (is (= (if (= :blue winner) "Синие: 100" "Красные: 100")
                   (.getText (ui ({:blue :blue-label :red :red-label} winner)))))
            (is (= {:players (:players finished) :objects (:objects finished)}
-                  (.getClientProperty map-panel :settlement.gui/state)))))))))
+                  (.getClientProperty map-panel :settlement.gui/state)))
+           (.doClick (:button screen) 0)
+           (is (= {:type :restart-match :match-id 0} (peek @requests)))
+           (is (= [true false true] @gameplay))
+           (is (not (.isVisible (:panel screen))))
+           (reset! response finished)
+           (gui/refresh! map-panel {} ui 1)
+           (is (not (.isVisible (:panel screen))))
+           (reset! response (assoc finished :match-id 1))
+           (gui/refresh! map-panel {} ui 1)
+           (is (.isVisible (:panel screen)))))))))
+
+(deftest polling-client-sees-result-after-another-player-restarts-test
+  (let [resumed (promise)
+        screen-ref (atom nil)]
+    (javax.swing.SwingUtilities/invokeAndWait
+     (fn []
+       (let [map-panel (gui/create-map-panel 0 0 1)
+             screen (gui/create-match-screen map-panel)
+             gameplay (atom [])
+             ui (assoc (gui/create-resource-panel {}) :match-view (atom nil)
+                       :match-id (atom 0) :match-screen screen
+                       :set-gameplay! (fn [enabled?]
+                                        (when (= [true false true] (swap! gameplay conj enabled?))
+                                          (deliver resumed true))))
+             active {:players {1 {:x 0 :y 0 :team :red}} :objects {} :match world/initial-match}
+             finish {:scores {:blue 100 :red 28} :phase :finished :winner :blue}
+             successor (assoc active :match-id 1 :previous-match {:id 0 :result finish})]
+         (reset! screen-ref screen)
+         (with-redefs [client/async! (fn [snapshot _ _ callback] (callback {:status :ok :world snapshot}))]
+           (gui/refresh! map-panel active ui 1)
+           (dotimes [_ 2] (gui/refresh! map-panel successor ui 1)))
+         (is (.isVisible (:panel screen)))
+         (is (not (.isEnabled (:button screen))))
+         (is (= "Поражение!" (.getText (:title screen))))
+         (is (= [true false] @gameplay)))))
+    (is (true? (deref resumed 5000 false)))
+    (javax.swing.SwingUtilities/invokeAndWait
+     #(is (not (.isVisible (:panel @screen-ref)))))))
 
 (deftest personal-resource-panels-test
   (register :a 1)
@@ -318,13 +377,13 @@
            panel-b (gui/create-map-panel 2 0)
            ui-a (gui/create-resource-panel (gui/player-resources (world/get-world) 1))
            ui-b (gui/create-resource-panel (gui/player-resources (world/get-world) 2))]
-       (is (= "Моё дерево: 0 | Мой камень: 0" (panel-text ui-a)))
-       (is (= "Моё дерево: 0 | Мой камень: 1" (panel-text ui-b)))
+       (is (= {:wood 0 :stone 0} (hotbar-resources ui-a)))
+       (is (= {:wood 0 :stone 1} (hotbar-resources ui-b)))
        (with-redefs [client/async! support/immediate-async]
          (support/process-message :a {:type :gather :player-id 1})
          (gui/update-player-panels! ui-a (world/get-world) 1)
-         (is (= "Моё дерево: 1 | Мой камень: 0" (panel-text ui-a)))
-         (is (= "Моё дерево: 0 | Мой камень: 1" (panel-text ui-b)))
+         (is (= {:wood 1 :stone 0} (hotbar-resources ui-a)))
+         (is (= {:wood 0 :stone 1} (hotbar-resources ui-b)))
          (let [timer-a (gui/start-map-updater panel-a {:writer :a} ui-a 1)
                timer-b (gui/start-map-updater panel-b {:writer :b} ui-b 2)]
            (try
@@ -332,8 +391,8 @@
              (doseq [timer [timer-a timer-b]
                      listener (.getActionListeners timer)]
                (.actionPerformed listener nil))
-             (is (= "Моё дерево: 1 | Мой камень: 0" (panel-text ui-a)))
-             (is (= "Моё дерево: 0 | Мой камень: 1" (panel-text ui-b)))
+             (is (= {:wood 1 :stone 0} (hotbar-resources ui-a)))
+             (is (= {:wood 0 :stone 1} (hotbar-resources ui-b)))
              (finally (.stop timer-a) (.stop timer-b)))))
        (is (= {:wood 1 :stone 0} (gui/player-resources (world/get-world) 1)))
        (is (= {:wood 0 :stone 1} (gui/player-resources (world/get-world) 2)))
@@ -375,8 +434,8 @@
             (is (= 1 (get-in before [:players 1 :collected :wood])))
             (is (= {:wood 1 :stone 0} (gui/player-resources (world/get-world) 1)))
             (is (= {:wood 0 :stone 1} (gui/player-resources (world/get-world) 2)))
-            (is (= "Моё дерево: 1 | Мой камень: 0"
-                   (panel-text (gui/create-resource-panel (gui/player-resources (world/get-world) 1)))))
+            (is (= {:wood 1 :stone 0}
+                   (hotbar-resources (gui/create-resource-panel (gui/player-resources (world/get-world) 1)))))
             (is (= :ok (:status (support/request b {:type :move :player-id 2 :direction :down}))))))
         (finally
           (doseq [[connection handler] @connections]
@@ -444,7 +503,7 @@
                    (into {} (map (fn [[id player]] [id ((juxt :x :y) player)]))
                          (get-in (client/request edn {:type :state}) [:world :players]))))
             (let [snapshot (line! "покажи мир")]
-              (is (str/includes? snapshot "players=[player(1,0,1,blue,\"Анна\"),player(2,2,0,red,\"Борис\")]"))
+              (is (str/includes? snapshot "players=[player(1,0,1,blue,\"Анна\"),player(2,2,0,blue,\"Борис\")]"))
               (is (str/ends-with? snapshot "attack_seq=0 repair_seq=0"))
               (doseq [secret [(:token registration) (:token other) (:server-instance registration)]]
                 (is (not (str/includes? snapshot secret)))))

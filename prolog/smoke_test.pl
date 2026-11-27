@@ -57,6 +57,7 @@ print_knowledge :-
     aggregate_all(count, settlement_knowledge:resource(_, _, _), Resources),
     aggregate_all(count, building(_, _, _, _, _, _, _, _), Buildings),
     aggregate_all(count, obstacle(_, _, _), Obstacles),
+    aggregate_all(count, bandit(_, _, _, _, _, _, _), Bandits),
     resource_counts(Wood, Stone),
     current_score(Blue, Red),
     match_state(Phase, Winner),
@@ -64,6 +65,7 @@ print_knowledge :-
            [Version, Width, Height, Id, Team, X, Y]),
     format('Игроков ~d, ресурсов ~d, построек ~d, препятствий ~d.~n',
            [Players, Resources, Buildings, Obstacles]),
+    format('Бандитов в снимке ~d.~n', [Bandits]),
     format('Инвентарь (~d дерева, ~d камня), счёт (~d синие, ~d красные), матч (~w, ~w).~n',
            [Wood, Stone, Blue, Red, Phase, Winner]).
 

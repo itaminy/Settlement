@@ -31,6 +31,10 @@
            [(str "отмени попытку добычи " id) {:type :gather-cancel :attempt-id id}]
            ["построй забор на 0 0" {:type :build :building-type :fence :position [0 0]}]
            ["построй дом на 12 8" {:type :build :building-type :house :position [12 8]}]
+           ["построй башню на 12 8" {:type :build :building-type :watchtower :position [12 8]}]
+           ["построй сторожевую башню на 12 8" {:type :build :building-type :watchtower :position [12 8]}]
+           ["построй лесопилку на 12 8" {:type :build :building-type :sawmill :position [12 8]}]
+           ["построй шахту на 12 8" {:type :build :building-type :mine :position [12 8]}]
            [(str "атакуй постройку на 12 8 id " id " номер 17")
             {:type :attack-building :position [12 8] :building-id building-id :attack-seq 17}]
            [(str "почини постройку на 12 8 id " id " номер 4")

@@ -32,6 +32,31 @@ test(static_house_blocks_only_its_recorded_cell) :-
     load_map(4, 2, 0, 1, [], [obstacle(1, 0, "house")]),
     path_to(cell(2, 1), [right, right]).
 
+test(rectangular_structures_occupy_the_same_cells_as_the_server) :-
+    ID = "01234567-89ab-cdef-0123-456789abcdef",
+    forall(member(Kind, ["watchtower", "sawmill", "mine"]),
+           ( load_map(8, 8, 0, 0, [], [building(ID, 3, 3, Kind, red, 2, 100, 100)]),
+             path_to(cell(4, 3), no_path),
+             path_to(cell(4, 4), Route),
+             ( Kind == "sawmill" -> assertion(Route == no_path) ; assertion(is_list(Route)) ) )).
+
+test(live_bandits_block_paths_and_waiting_bandits_do_not) :-
+    Id = "01234567-89ab-cdef-0123-456789abcdef",
+    load_map(3, 1, 0, 0, [], [bandit(Id, 1, 0, 100, 100, "patrol", "right")]),
+    path_to(cell(2,0), no_path),
+    path_to(attack_bandit(Id), []),
+    update_map(2, 3, 1, 0, 0, [], [bandit(Id, none, none, 0, 100, "waiting", "right")]),
+    path_to(cell(2,0), [right,right]),
+    path_to(attack_bandit(Id), no_path).
+
+test(large_world_crosses_only_at_reported_bridge) :-
+    findall(obstacle(50, Y, "water"), (between(0, 99, Y), Y =\= 51), River),
+    load_map(100, 100, 49, 49, [], [obstacle(52, 49, "mountain") | River]),
+    path_to(cell(51, 49), [down, down, right, right, up, up]),
+    path_to(cell(50, 49), no_path),
+    path_to(cell(52, 49), no_path),
+    path_to(cell(100, 51), no_path).
+
 test(no_path_and_invalid_targets) :-
     load_map(3, 3, 0, 1, [],
              [resource(1, 0, tree), obstacle(1, 1, "house"), resource(1, 2, stone)]),
@@ -104,5 +129,12 @@ test(building_may_not_sever_a_corridor) :-
     load_map(5, 3, 1, 1, [], [obstacle(2, 0, "house"), obstacle(2, 2, "house")]),
     construction_terrain(Terrain),
     assertion(\+ preserves_access(Terrain, build(fence, 2, 1))).
+
+test(protected_road_is_walkable_but_cannot_be_built_on) :-
+    load_map(5, 3, 1, 1, [], [reserved(2, 1)]),
+    path_to(cell(3, 1), [right, right]),
+    construction_terrain(Terrain),
+    assertion(\+ preserves_access(Terrain, build(house, 2, 1))),
+    assertion(preserves_access(Terrain, build(fence, 3, 1))).
 
 :- end_tests(settlement_pathfinding).

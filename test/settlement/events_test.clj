@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is use-fixtures]]
             [settlement.auth :as auth]
             [settlement.buildings :as buildings]
+            [settlement.config :as config]
             [settlement.event-log :as log]
             [settlement.event-stream :as stream]
             [settlement.layout :as layout]
@@ -15,9 +16,11 @@
 
 (use-fixtures :each
   (fn [test]
-    (with-redefs [auth/state (ref (auth/new-state))
+    (with-redefs [config/bot-timing-ms {:move 0 :action 0 :after-build 0}
+                  auth/state (ref (auth/new-state))
                   log/journal (log/new-log)
                   layout/spawn-cells support/row-major-spawn
+                  layout/red-spawn-cells (delay (support/row-major-spawn))
                   buildings/protected-cells #{[0 0]}
                   world/world (ref {:players {} :objects {[1 0] :tree}
                                     :resources {:wood 0 :stone 0} :match world/initial-match})
@@ -54,13 +57,94 @@
   (protocol/read-message (text! client (protocol/write-message command))))
 
 (defn- register! [client id]
-  (edn! client {:type :register :player-id id :name (str "Игрок " id)}))
+  (edn! client {:type :register :player-id id :name (str "Игрок " id) :client-kind (if (= id 2) :prolog :human)}))
 
 (defn- silent? [{:keys [^Socket socket] :as client}]
   (.setSoTimeout socket 150)
   (try (read-line! client) false
        (catch SocketTimeoutException _ true)
        (finally (.setSoTimeout socket 5000))))
+
+(def ^:private real-schedule-restore world/schedule-resource-restore)
+
+(deftest old-resource-restore-cannot-modify-new-match-test
+  (let [sleeping (promise)
+        wake (promise)
+        cell (last (remove world/initial-objects (layout/spawn-cells)))]
+    (is (= :ok (:status (server/process-message :player {:type :register :player-id 1 :name "Blue"}))))
+    (with-redefs [world/wait-for-restore (fn [_] (deliver sleeping true) (deref wake 5000 nil))]
+      (let [task (real-schedule-restore cell :tree)]
+        (try
+          (is (true? (deref sleeping 5000 false)))
+          (dosync (alter world/world assoc :match {:phase :finished :winner :blue
+                                                   :scores {:blue 100 :red 0}}))
+          (is (= :ok (:status (server/process-message :player {:type :restart-match :match-id 0}))))
+          (let [version (:version @log/journal)]
+            (deliver wake true)
+            (is (not= ::timeout (deref task 5000 ::timeout)))
+            (is (nil? (get-in @world/world [:objects cell])))
+            (is (= version (:version @log/journal))))
+          (finally
+            (deliver wake true)
+            (future-cancel task)))))))
+
+(deftest match-restart-shared-by-edn-and-prolog-style-text-clients-test
+  (with-open [listener (ServerSocket. 0)]
+    (let [edn (open-client listener)
+          text (open-client listener)
+          restart {:type :restart-match :match-id 0}]
+      (try
+        (is (= :not-authenticated (:code (edn! edn restart))))
+        (is (= :ok (:status (register! edn 1))))
+        (is (= :ok (:status (register! text 2))))
+        (is (= :match-active (:code (edn! edn restart))))
+        (is (= :text (:mode (protocol/read-message (text! text "текст 1")))))
+        (dosync
+          (alter world/world update-in [:players 1] assoc :x 10 :y 10
+                 :inventory {:items {:wood 20 :stone 10}})
+          (alter world/world update-in [:players 2] assoc :x 13 :y 10
+                 :inventory {:items {:stone 5}})
+          (alter world/world assoc-in [:building-attacks 2 :seq] 8)
+          (alter world/world assoc-in [:match :scores :blue] 80)
+          (alter world/world update :objects into
+                 (for [i (range 4)]
+                   [[(+ 1 (* 3 i)) 20]
+                    {:type :building :kind :sawmill :team :blue :owner-id 1
+                     :building-id (random-uuid) :hp 50 :max-hp 50}])))
+        (is (= :ok (:status (edn! edn {:type :subscribe-events}))))
+        (is (re-find #"^reply v=1 ok subscribe-events" (text! text "подпишись на события")))
+        (is (= :finished (get-in (edn! edn {:type :build :player-id 1 :match-id 0
+                                            :building-type :sawmill :position [11 10]})
+                                 [:world :match :phase])))
+        (let [event (protocol/read-message (read-line! edn))]
+          (is (= [:building-created :score-changed :match-finished] (:changes event)))
+          (is (re-find #"changes=\[building-created,score-changed,match-finished\]" (read-line! text)))
+          (is (re-find #"blue=100 red=0 phase=finished winner=blue"
+                       (text! text "покажи мир с версией")))
+          (is (= :match-finished (:code (edn! edn {:type :move :player-id 1 :direction :down}))))
+          (let [new-world (:world (edn! edn restart))
+                next-event (protocol/read-message (read-line! edn))]
+            (is (= 1 (:match-id new-world)))
+            (is (= world/initial-match (:match new-world)))
+            (is (= {:scores {:blue 100 :red 0} :phase :finished :winner :blue}
+                   (get-in new-world [:previous-match :result])))
+            (is (= world/initial-objects (:objects new-world)))
+            (is (= {:wood 0 :stone 0} (:resources new-world)))
+            (is (= [1 2] (sort (keys (:players new-world)))))
+            (is (= [:blue :red] (mapv #(get-in new-world [:players % :team]) [1 2])))
+            (is (= (:world (edn! edn {:type :state})) new-world))
+            (is (= (inc (:seq event)) (:seq next-event)))
+            (is (= [:match-started :score-changed] (:changes next-event)))
+            (is (re-find #"changes=\[match-started,score-changed\]" (read-line! text)))
+            (let [snapshot (text! text "покажи мир с версией")]
+              (is (re-find #"blue=0 red=0 phase=active winner=none" snapshot))
+              (is (re-find #"inventory_wood=0 inventory_stone=0.*attack_seq=0 repair_seq=0 online=\[1,2\]" snapshot)))
+            (is (= :stale-match (:code (edn! edn restart))))
+            (is (= :stale-match (:code (edn! edn {:type :move :player-id 1 :direction :down :match-id 0}))))
+            (is (= :match-active (:code (edn! edn (assoc restart :match-id 1)))))))
+        (finally
+          (close-client edn)
+          (close-client text))))))
 
 (deftest mixed-subscribers-and-snapshot-gap-test
   (with-open [listener (ServerSocket. 0)]
@@ -108,7 +192,7 @@
         (finally (doseq [client [edn text legacy]] (close-client client)))))))
 
 (defn- register-local! [id]
-  (server/process-message id {:type :register :player-id id :name (str id)}))
+  (server/process-message id {:type :register :player-id id :name (str id) :client-kind (if (= id 2) :prolog :human)}))
 
 (deftest concurrent-changes-test
   (register-local! 1)
@@ -152,12 +236,12 @@
     (dosync
       (alter world/world assoc-in [:players 1 :x] 10)
       (alter world/world assoc-in [:players 1 :y] 10)
-      (alter world/world assoc-in [:players 2 :x] 12)
+      (alter world/world assoc-in [:players 2 :x] 13)
       (alter world/world assoc-in [:players 2 :y] 10)
       (alter world/world assoc-in [:objects target]
-             {:kind :fence :type :building :team :red :owner-id 2
-              :building-id building-id :hp 10 :max-hp 50})
-      (alter world/world assoc-in [:match :scores :red] 2))
+             {:kind :watchtower :type :building :team :red :owner-id 2
+              :building-id building-id :hp 10 :max-hp 150})
+      (alter world/world assoc-in [:match :scores :red] 10))
     (world/change-player-items! 2 {:wood 1})
     (let [version (:version @log/journal)]
       (is (= :ok (:status (world/repair-building! 2 target building-id 1))))
@@ -171,12 +255,12 @@
              (map :changes (log/after @log/journal version)))))
     (dosync
       (alter world/world update :objects into
-             (for [index (range 49)]
-               [[(+ 1 (mod index 25)) (+ 20 (* 3 (quot index 25)))]
-                {:type :building :kind :fence :team :blue}]))
-      (alter world/world assoc-in [:match :scores :blue] 98))
-    (world/change-player-items! 1 {:wood 2})
-    (let [result (world/build! 1 :fence target)]
+             (for [index (range 4)]
+               [[(+ 1 (* 3 index)) 20]
+                {:type :building :kind :sawmill :team :blue}]))
+      (alter world/world assoc-in [:match :scores :blue] 80))
+    (world/change-player-items! 1 {:wood 20 :stone 10})
+    (let [result (world/build! 1 :sawmill target)]
       (is (= :ok (:status result)) (pr-str result)))
     (is (= [:building-created :score-changed :match-finished]
            (-> @log/journal :events peek :changes)))

@@ -1,6 +1,7 @@
 (ns settlement.mechanics-test
   (:require [clojure.test :refer :all]
             [settlement.layout :as layout]
+            [settlement.config :as config]
             [settlement.world :as world]
             [settlement.auth :as auth]
             [settlement.server :as server]
@@ -9,14 +10,16 @@
 (use-fixtures :each
   (fn [f]
     (reset! support/time-ns 0)
-    (with-redefs [layout/spawn-cells support/row-major-spawn
+    (with-redefs [config/bot-timing-ms {:move 0 :action 0 :after-build 0}
+                  layout/spawn-cells support/row-major-spawn
+                  layout/red-spawn-cells (delay (support/row-major-spawn))
                   world/world (ref {:players {} :resources {:wood 0 :stone 0} :objects {[1 0] :tree [3 0] :stone}})
                   world/gathering (ref {}) auth/state (ref (auth/new-state))
                   world/now-ns #(deref support/time-ns)
                   world/schedule-resource-restore (fn [_ _] nil)] (f))))
 
 (defn- register! [id]
-  (server/process-message id {:type :register :player-id id :name (str id)}))
+  (server/process-message id {:type :register :player-id id :name (str id) :client-kind (if (= id 2) :prolog :human)}))
 (defn- start! [id]
   (server/process-message id {:type :gather-start :player-id id :attempt-id (str (java.util.UUID/randomUUID))}))
 

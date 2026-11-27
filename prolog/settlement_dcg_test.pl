@@ -18,10 +18,18 @@ success_case("gather-cancel operation_id=~s attempt_id=none",
              gather_cancel(Id, none)) :- uuid(Id).
 success_case("build building=building(12,8,~s,fence,red,2,40,50)",
              build(building(Id, 12, 8, "fence", red, 2, 40, 50))) :- uuid(Id).
+success_case("build building=building(12,8,~s,watchtower,red,2,150,150)",
+             build(building(Id, 12, 8, "watchtower", red, 2, 150, 150))) :- uuid(Id).
+success_case("build building=building(12,8,~s,sawmill,red,2,240,240)",
+             build(building(Id, 12, 8, "sawmill", red, 2, 240, 240))) :- uuid(Id).
+success_case("build building=building(12,8,~s,mine,red,2,260,260)",
+             build(building(Id, 12, 8, "mine", red, 2, 260, 260))) :- uuid(Id).
 success_case("attack-building attack_seq=17 x=12 y=8 building_id=~s hp=40 destroyed=false",
              attack_building(17, 12, 8, Id, 40, false)) :- uuid(Id).
 success_case("attack-building attack_seq=18 x=12 y=8 building_id=~s hp=0 destroyed=true",
              attack_building(18, 12, 8, Id, 0, true)) :- uuid(Id).
+success_case("attack-bandit attack_seq=19 x=12 y=8 bandit_id=~s hp=0 destroyed=true",
+             attack_bandit(19, 12, 8, Id, 0, true)) :- uuid(Id).
 success_case("repair-building repair_seq=4 x=12 y=8 building_id=~s hp=50 restored_hp=10",
              repair_building(4, 12, 8, Id, 50, 10)) :- uuid(Id).
 success_case("subscribe-events since=40 version=42", subscribe_events(40, 42)).

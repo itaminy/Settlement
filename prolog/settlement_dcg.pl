@@ -70,6 +70,9 @@ success(world_versioned(Version, World, Online, Gathering)) -->
 success(subscribe_events(Since, Version)) -->
     "subscribe-events since=", decimal(Since), " version=", decimal(Version).
 success(unsubscribe_events) --> "unsubscribe-events".
+success(attack_bandit(Seq, X, Y, Id, HP, Destroyed)) -->
+    "attack-bandit attack_seq=", decimal(Seq), " x=", decimal(X), " y=", decimal(Y),
+    " bandit_id=", uuid(Id), " hp=", decimal(HP), " destroyed=", boolean(Destroyed).
 
 position(X, Y) --> " x=", decimal(X), " y=", decimal(Y).
 
@@ -116,6 +119,12 @@ object(resource(X, Y, Type)) -->
     "resource(", decimal(X), ",", decimal(Y), ",", resource_type(Type), ")".
 object(obstacle(X, Y, Kind)) -->
     "obstacle(", decimal(X), ",", decimal(Y), ",", token(Kind), ")".
+object(bandit(Id, X, Y, HP, Max, State, Direction)) -->
+    "bandit(", uuid(Id), ",", optional(decimal, X), ",", optional(decimal, Y), ",",
+    decimal(HP), ",", decimal(Max), ",", token(State), ",", token(Direction), ")".
+object(downed(Id)) --> "downed(", decimal(Id), ")".
+object(health(Id, HP)) --> "health(", decimal(Id), ",", decimal(HP), ")".
+object(reserved(X, Y)) --> "reserved(", decimal(X), ",", decimal(Y), ")".
 object(Building) --> building(Building).
 
 building(building(Id, X, Y, Kind, Team, Owner, HP, MaxHP)) -->

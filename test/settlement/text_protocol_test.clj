@@ -1,5 +1,6 @@
 (ns settlement.text-protocol-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is]]
             [settlement.config :as config]
             [settlement.text-protocol :refer [write-reply]]))
 
@@ -64,3 +65,13 @@
                                  :resources {:wood 5 :stone 7}
                                  :match {:scores {:blue 0 :red 100} :phase :finished :winner :red}}
                          :building-sequences {:attack-seq 17 :repair-seq 4}})))))
+
+(deftest text-snapshot-only-includes-own-health
+  (let [snapshot {:status :ok
+                  :world {:players {1 {:x 0 :y 1 :team :blue :name "Blue" :hp 20}
+                                    2 {:x 2 :y 0 :team :red :name "Red" :hp 0 :respawn-at 10}}}
+                  :building-sequences {:attack-seq 0 :repair-seq 0}}
+        blue (write-reply {:type :state :player-id 1} snapshot)
+        red (write-reply {:type :state :player-id 2} snapshot)]
+    (is (str/includes? blue "objects=[downed(2),health(1,20)]"))
+    (is (str/includes? red "objects=[downed(2),health(2,0)]"))))

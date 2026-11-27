@@ -45,12 +45,22 @@
     :else (record-value "obstacle" x y object)))
 
 (defn- world-fields [id {:keys [world building-sequences]}]
-  (let [{:keys [players objects resources match]} world
+  (let [{:keys [players objects resources match bandits]} world
         {:keys [scores phase winner]} match]
     (str (fields "width" config/world-width "height" config/world-height "self" id
                  "players" (list-value (for [[player-id {:keys [x y team name]}] (sort-by key players)]
                                          (record-value "player" player-id x y team (quoted name))))
-                 "objects" (list-value (map object-record (sort-by key objects)))
+                 "objects" (list-value
+                             (concat (map object-record (sort-by key objects))
+                                     (for [[id {:keys [x y hp max-hp direction state]}] (sort-by key bandits)]
+                                       (record-value "bandit" id x y hp max-hp state direction))
+                                     (for [[id player] (sort-by key players) :when (:respawn-at player)]
+                                       (record-value "downed" id))
+                                     (when-some [hp (get-in players [id :hp])]
+                                       [(record-value "health" id hp)])
+                                     (when (contains? world :world-seed)
+                                       (for [[x y] (sort buildings/protected-cells)]
+                                         (record-value "reserved" x y)))))
                  "total_wood" (get resources :wood 0) "total_stone" (get resources :stone 0)
                  "blue" (get scores :blue 0) "red" (get scores :red 0)
                  "phase" (or phase :active) "winner" winner)
@@ -70,7 +80,7 @@
          (some? last-repair-seq) (fields "last_repair_seq" last-repair-seq))))
 
 (defn- success-fields [{:keys [type player-id operation-id attempt-id attack-seq repair-seq]} result]
-  (let [{:keys [position building anchor building-id hp]} result]
+  (let [{:keys [position building anchor building-id bandit-id hp]} result]
     (case type
       :state (if (contains? result :world-version)
                (str "world-versioned" (fields "version" (:world-version result))
@@ -94,6 +104,9 @@
       :attack-building (str "attack-building"
                             (fields "attack_seq" attack-seq "x" (first anchor) "y" (second anchor)
                                     "building_id" building-id "hp" hp "destroyed" (:destroyed? result)))
+      :attack-bandit (str "attack-bandit"
+                          (fields "attack_seq" attack-seq "x" (first anchor) "y" (second anchor)
+                                  "bandit_id" bandit-id "hp" hp "destroyed" (:destroyed? result)))
       :repair-building (str "repair-building"
                             (fields "repair_seq" repair-seq "x" (first anchor) "y" (second anchor)
                                     "building_id" building-id "hp" hp "restored_hp" (:restored-hp result))))))

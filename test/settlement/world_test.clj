@@ -4,7 +4,11 @@
             [settlement.server :as server]
             [settlement.auth :as auth]
             [settlement.auth-test]
+            [settlement.bandits-test]
+            [settlement.effects-test]
+            [settlement.ui-theme-test]
             [settlement.rendering-test]
+            [settlement.minimap-test]
             [settlement.gui :as gui]
             [settlement.world :as world]
             [settlement.config :as config]
@@ -65,8 +69,8 @@
     (is (= 3 (:house (frequencies (vals objects)))))
     (is (= layout/house-positions (set (for [[p kind] objects :when (= kind :house)] p))))
     (is (not (contains? objects layout/spawn-position)))
-    (is (= gui/map-size config/world-width 50))
-    (is (= config/world-height 50))
+    (is (= gui/map-size config/world-width 100))
+    (is (= config/world-height 100))
     (is (every? config/in-bounds? (keys objects)))
     (is (= (- (* config/world-width config/world-height) (count objects)) (count reachable)))
     (doseq [[position object] objects :when (#{:tree :stone} object)]
@@ -99,7 +103,7 @@
              (update-vals (:players migrated) #(dissoc % :team))))
       (is (= (assoc-in objects [[10 10] :team] :red) (:objects migrated)))
       (is (= (:resources initial-world) (:resources migrated)))
-      (is (= {:scores {:blue 2 :red 2} :phase :active :winner nil} (:match migrated)))
+      (is (= {:scores {:blue 0 :red 0} :phase :active :winner nil} (:match migrated)))
       (world/migrate-teams!)
       (is (= migrated @world/world)))))
 
@@ -456,7 +460,7 @@
     (when-not (#{"fast" "slow" "all"} suite)
       (throw (ex-info "Expected fast, slow or all" {:suite suite})))
     (try
-      (let [tests (->> ["settlement.world-test" "settlement.auth-test" "settlement.rendering-test" "settlement.inventory-test"
+      (let [tests (->> ["settlement.world-test" "settlement.auth-test" "settlement.bandits-test" "settlement.effects-test" "settlement.ui-theme-test" "settlement.rendering-test" "settlement.minimap-test" "settlement.inventory-test"
                        "settlement.mechanics-test" "settlement.transport-test" "settlement.layout-test" "settlement.buildings-test"
                        "settlement.text-commands-test" "settlement.text-protocol-test" "settlement.events-test"]
                        (mapcat #(vals (ns-interns (symbol %))))

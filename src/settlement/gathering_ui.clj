@@ -3,7 +3,10 @@
 
 (defn now-ms [] (quot (System/nanoTime) 1000000))
 
-(defn create-controller [connection player-id progress refresh!]
+(defn create-controller
+  ([connection player-id progress refresh!]
+   (create-controller connection player-id progress refresh! (fn [_ _])))
+  ([connection player-id progress refresh! effect!]
   (let [state (atom nil) pressed (atom false)
         reset-ui! (fn [] (.setValue progress 0) (.setVisible progress false))
         current? (fn [attempt] (= attempt (:attempt-id @state)))
@@ -12,6 +15,7 @@
                      (reset! pressed false)
                      (reset! state nil)
                      (reset-ui!)
+                     (effect! :cancel nil)
                      (when old
                        (client/async! connection [:cancel (:attempt-id old)]
                          {:type :gather-cancel :player-id player-id :attempt-id (:attempt-id old)
@@ -20,11 +24,14 @@
         respond! (fn [attempt response]
                    (when (current? attempt)
                      (cond
-                       (:completed response) (do (reset! state nil) (reset-ui!) (refresh!))
+                       (:completed response) (do (effect! :gather-finish response)
+                                                 (reset! state nil) (reset-ui!) (refresh!))
                        (or (= :ok (:status response)) (= :too-early (:code response)))
-                       (swap! state merge (select-keys response [:operation-id :elapsed-ms :duration-ms])
-                              {:stamp (now-ms)})
-                       :else (do (reset! state nil) (reset-ui!) (refresh!)))))
+                       (do (when (and (= :ok (:status response)) (nil? (:operation-id @state)))
+                             (effect! :gather-start response))
+                           (swap! state merge (select-keys response [:operation-id :elapsed-ms :duration-ms])
+                                  {:stamp (now-ms)}))
+                       :else (do (effect! :cancel nil) (reset! state nil) (reset-ui!) (refresh!)))))
         press! (fn []
                  (when (compare-and-set! pressed false true)
                    (let [attempt (str (java.util.UUID/randomUUID))]
@@ -48,4 +55,4 @@
                             {:type (if finish? :gather-finish :gather-heartbeat)
                              :player-id player-id :operation-id operation-id}
                             #(respond! attempt-id %) #(current? attempt-id) false)))))))]
-    {:state state :pressed pressed :press! press! :release! release! :tick! tick!}))
+    {:state state :pressed pressed :press! press! :release! release! :tick! tick!})))

@@ -1,7 +1,8 @@
-{:paths ["src" "test"]
+{:paths ["src" "test" "resources"]
 
  :deps
  {org.clojure/clojure {:mvn/version "1.12.6"}}
 
  :aliases
- {:run {:main-opts ["-m" "settlement.core"]}}}
+ {:run {:main-opts ["-m" "settlement.core"]}
+  :gui {:main-opts ["-m" "settlement.gui"]}}}
